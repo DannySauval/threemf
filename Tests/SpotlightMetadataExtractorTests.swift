@@ -1,5 +1,8 @@
 import Darwin
 import XCTest
+#if canImport(ThreeMFCore)
+    @testable import ThreeMFCore
+#endif
 
 final class SpotlightMetadataExtractorTests: XCTestCase {
     func testUnknownFileSize_failsClosed() {

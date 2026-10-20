@@ -7,12 +7,20 @@ on:
       - "Sources/**"
       - "Tests/**"
       - "project.yml"
+      - "Package.swift"
+      - "Package.resolved"
+      - ".swiftformat"
+      - ".github/workflows/test.yml"
   pull_request:
     branches: [main]
     paths:
       - "Sources/**"
       - "Tests/**"
       - "project.yml"
+      - "Package.swift"
+      - "Package.resolved"
+      - ".swiftformat"
+      - ".github/workflows/test.yml"
 
 jobs:
   test:
@@ -29,8 +37,11 @@ jobs:
       - name: Build
         run: xcodebuild -project threemf.xcodeproj -scheme ThreeMFQuickLook -configuration Release build CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO MACOSX_DEPLOYMENT_TARGET=14.0
 
-      - name: Test
+      - name: Test (Xcode)
         run: xcodebuild -project threemf.xcodeproj -scheme ThreeMFTests -configuration Debug test CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO MACOSX_DEPLOYMENT_TARGET=14.0
+
+      - name: Build & Test (SwiftPM)
+        run: swift test
 
       - name: SwiftFormat lint
         run: |

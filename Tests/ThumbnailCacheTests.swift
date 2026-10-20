@@ -1,5 +1,8 @@
 import Foundation
 import XCTest
+#if canImport(ThreeMFCore)
+    @testable import ThreeMFCore
+#endif
 
 final class ThumbnailCacheTests: XCTestCase {
     /// Each test gets a unique source file so cache keys don't collide between tests.

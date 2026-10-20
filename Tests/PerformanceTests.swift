@@ -2,6 +2,9 @@ import SceneKit
 import simd
 import XCTest
 import ZIPFoundation
+#if canImport(ThreeMFCore)
+    @testable import ThreeMFCore
+#endif
 
 /// Performance regression suite. Builds large synthetic STL/3MF/G-code fixtures once and
 /// measures parser throughput. Numbers are recorded by XCTest as baselines; CI can compare

@@ -76,6 +76,8 @@ public enum GCodeParser {
         var feedrate: Float = 0
         var layerIndex = 0
         var lastLayerZ: Float = -.infinity
+        var lastExtrudedZ: Float = -.infinity
+        var extrudedOnCurrentLayer = false
         var totalExtrudedMM: Float = 0
         var totalTravelMM: Float = 0
         var estimatedSeconds: Double = 0
@@ -142,10 +144,53 @@ public enum GCodeParser {
                 }
             }
 
-            func noteLayer(forZ newZ: Float) {
-                if newZ > lastLayerZ + 0.001 {
-                    layerIndex = lastLayerZ == -.infinity ? 0 : layerIndex + 1
+            func noteLayer(forZ newZ: Float, extrudes: Bool) {
+                if lastLayerZ == -.infinity {
+                    layerIndex = 0
                     lastLayerZ = newZ
+                } else if newZ > lastLayerZ + 0.001 {
+                    if extrudedOnCurrentLayer {
+                        layerIndex += 1
+                        extrudedOnCurrentLayer = false
+                    }
+                    lastLayerZ = newZ
+                } else if newZ < lastLayerZ - 0.001, !extrudedOnCurrentLayer {
+                    if lastExtrudedZ == -.infinity {
+                        // Still in pre-print travel moves (e.g. G0 Z10 homing lift before layer 1);
+                        // adopt the lower Z on layer 0 rather than collapsing early print layers.
+                        lastLayerZ = newZ
+                    } else if newZ <= lastExtrudedZ + 0.001 {
+                        // Travel Z-hop returned to the current print layer without extruding.
+                        layerIndex = max(0, layerIndex - 1)
+                        lastLayerZ = lastExtrudedZ
+                        extrudedOnCurrentLayer = true
+                    } else {
+                        // Travel Z-hop lowered onto the next print layer above lastExtrudedZ.
+                        lastLayerZ = newZ
+                    }
+                }
+                if extrudes {
+                    extrudedOnCurrentLayer = true
+                    lastExtrudedZ = newZ
+                }
+            }
+
+            func skipWhitespaceAndParens(_ cursor: inout Int, limit: Int) {
+                while cursor < limit {
+                    let b = base[cursor]
+                    if b == 0x20 || b == 0x09 {
+                        cursor += 1
+                    } else if b == 0x28 { // '('
+                        cursor += 1
+                        while cursor < limit, base[cursor] != 0x29 { // ')'
+                            cursor += 1
+                        }
+                        if cursor < limit {
+                            cursor += 1
+                        }
+                    } else {
+                        break
+                    }
                 }
             }
 
@@ -165,20 +210,15 @@ public enum GCodeParser {
                 // secondary scans over the same range after the cancellable newline search.
                 guard lineEnd - i <= 1_048_576 else { continue }
 
-                // Skip leading whitespace.
-                var p = i
-                while p < lineEnd, base[p] == 0x20 || base[p] == 0x09 {
-                    p += 1
-                }
-                guard p < lineEnd else { continue }
-
-                // Skip comments (`;` or `()` after the command). We process the part
-                // before any `;` and ignore parenthesized comments inline-by-position.
+                // Skip comments (`;` or `()`). Process the portion before any `;` and
+                // skip parenthesized comments inline.
                 var commentStart = lineEnd
-                for j in p ..< lineEnd where base[j] == 0x3B {
+                for j in i ..< lineEnd where base[j] == 0x3B {
                     commentStart = j; break
                 }
                 let endOfCode = commentStart
+                var p = i
+                skipWhitespaceAndParens(&p, limit: endOfCode)
                 guard p < endOfCode else { continue }
 
                 let letter = base[p]
@@ -234,7 +274,8 @@ public enum GCodeParser {
                 let isLinear = cmdNum == 0 || cmdNum == 1
                 let isArcCW = cmdNum == 2
                 let isArcCCW = cmdNum == 3
-                guard isLinear || isArcCW || isArcCCW else { continue }
+                let isSetPosition = cmdNum == 92
+                guard isLinear || isArcCW || isArcCCW || isSetPosition else { continue }
 
                 // Non-XY plane: skip arcs (G17 assumed for arcs we do handle).
                 if isArcCW || isArcCCW, !planeIsXY {
@@ -252,19 +293,17 @@ public enum GCodeParser {
                 var sawR = false
 
                 while p < endOfCode {
-                    while p < endOfCode, base[p] == 0x20 || base[p] == 0x09 {
-                        p += 1
-                    }
+                    skipWhitespaceAndParens(&p, limit: endOfCode)
                     guard p < endOfCode else { break }
                     let key = base[p]
                     p += 1
                     let valStart = p
                     while p < endOfCode {
                         let c = base[p]
-                        // End of token when we hit whitespace or another letter.
+                        // End of token when we hit whitespace, comment opener, or another letter.
                         // Keep an exponent marker (`1e999`, `1E-3`) inside the number so
                         // it is not parsed as a new E-axis word.
-                        if c == 0x20 || c == 0x09 {
+                        if c == 0x20 || c == 0x09 || c == 0x28 {
                             break
                         }
                         let isLetter = (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A)
@@ -288,21 +327,21 @@ public enum GCodeParser {
 
                     switch key {
                     case 0x58, 0x78: // X
-                        if absoluteXYZ {
+                        if absoluteXYZ || isSetPosition {
                             newX = value
                         } else {
                             newX = pos.x + value
                         }
                         sawX = true
                     case 0x59, 0x79: // Y
-                        if absoluteXYZ {
+                        if absoluteXYZ || isSetPosition {
                             newY = value
                         } else {
                             newY = pos.y + value
                         }
                         sawY = true
                     case 0x5A, 0x7A: // Z
-                        if absoluteXYZ {
+                        if absoluteXYZ || isSetPosition {
                             newZ = value
                         } else {
                             newZ = pos.z + value
@@ -336,6 +375,24 @@ public enum GCodeParser {
                     continue
                 }
 
+                if isSetPosition {
+                    // G92 resets logical axis coordinates (most commonly `G92 E0` in M82 mode)
+                    // without moving the toolhead or emitting a segment.
+                    if sawX {
+                        pos.x = newX
+                    }
+                    if sawY {
+                        pos.y = newY
+                    }
+                    if sawZ {
+                        pos.z = newZ
+                    }
+                    if sawE {
+                        lastE = newE
+                    }
+                    continue
+                }
+
                 let extrudes: Bool = if absoluteE {
                     sawE && newE > lastE
                 } else {
@@ -343,7 +400,7 @@ public enum GCodeParser {
                 }
 
                 if isLinear {
-                    noteLayer(forZ: newZ)
+                    noteLayer(forZ: newZ, extrudes: extrudes)
                     let newPos = simd_float3(newX, newY, newZ)
                     emitSegment(from: pos, to: newPos, extrudes: extrudes)
                     pos = newPos
@@ -418,7 +475,7 @@ public enum GCodeParser {
                     nSeg = min(nSeg, remaining)
                 }
 
-                noteLayer(forZ: newZ)
+                noteLayer(forZ: newZ, extrudes: extrudes)
 
                 var prev = pos
                 for s in 1 ... nSeg {

@@ -1,6 +1,9 @@
 import Foundation
 import simd
 import Testing
+#if canImport(ThreeMFCore)
+    @testable import ThreeMFCore
+#endif
 
 /// Pilot suite using Apple's `swift-testing` framework (`@Test` macros) instead of XCTest.
 /// Coexists with the XCTest suites; demonstrates the modern pattern for new tests we add

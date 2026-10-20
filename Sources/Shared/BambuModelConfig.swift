@@ -100,11 +100,14 @@ public struct BambuModelConfig: Sendable, Hashable {
 
     /// Parses `model_settings.config` (XML) into plates and object→extruder assignments.
     private static func parseModelSettings(_ data: Data?) -> ([ResolvedPlate], [String: Int]) {
-        guard let data, !data.isEmpty else { return ([], [:]) }
+        guard let data, !data.isEmpty,
+              !ThreeMFMeshParser.containsDTDOrEntityDeclaration(data)
+        else { return ([], [:]) }
         let delegate = ModelSettingsDelegate()
         let parser = XMLParser(data: data)
         parser.delegate = delegate
         parser.shouldProcessNamespaces = false
+        parser.shouldResolveExternalEntities = false
         guard parser.parse() else { return ([], [:]) }
         // Plates sorted by id so display order is deterministic and matches plater_id.
         let plates = delegate.plates
@@ -123,6 +126,10 @@ public struct BambuModelConfig: Sendable, Hashable {
         return raw.map { parseHexColor($0) ?? SIMD4<Float>(0.85, 0.85, 0.85, 1) }
     }
 
+    /// Maximum `paint_color` hex length accepted per triangle. Real MMU segmentation strings
+    /// are a few dozen to a few hundred chars; capping bounds work on crafted attributes.
+    private static let maxPaintColorHexBytes = 4096
+
     /// Decodes a Bambu/PrusaSlicer `paint_color` (a.k.a. `mmu_segmentation`) hex string into
     /// the dominant **extruder index (1-based)** painted on the triangle, or `0` for none/base.
     ///
@@ -132,31 +139,30 @@ public struct BambuModelConfig: Sendable, Hashable {
     /// `3+e`, `e==14` → 8-bit extended `17+v`). A split triangle has 2 bits `special_side` then
     /// `nss+1` recursive children; we collect leaf states and return the most common painted one.
     static func decodePaintColor(_ hex: String) -> Int {
-        guard !hex.isEmpty else { return 0 }
-        var bits: [Bool] = []
-        bits.reserveCapacity(hex.count * 4)
-        for ch in hex.reversed() {
-            guard let v = ch.hexDigitValue else { return 0 }
-            bits.append(v & 1 != 0)
-            bits.append(v & 2 != 0)
-            bits.append(v & 4 != 0)
-            bits.append(v & 8 != 0)
+        let utf8 = Array(hex.utf8)
+        guard !utf8.isEmpty, utf8.count <= maxPaintColorHexBytes else { return 0 }
+        for b in utf8 where hexNibble(b) == nil {
+            return 0
         }
+        let totalBits = utf8.count * 4
         var pos = 0
         func read(_ n: Int) -> Int {
             var r = 0
             for i in 0 ..< n {
-                guard pos < bits.count else { break }
-                if bits[pos] {
+                guard pos < totalBits else { break }
+                let byteIdx = utf8.count - 1 - (pos >> 2)
+                let bitOffset = pos & 3
+                let nibble = hexNibble(utf8[byteIdx]) ?? 0
+                if (nibble & (1 << bitOffset)) != 0 {
                     r |= (1 << i)
                 }
                 pos += 1
             }
             return r
         }
-        var states: [Int] = []
+        var counts: [Int: Int] = [:]
         func decode(depth: Int) {
-            guard depth < 32, pos < bits.count else { return }
+            guard depth < 32, pos < totalBits else { return }
             let nss = read(2)
             if nss == 0 {
                 let sc = read(2)
@@ -171,7 +177,9 @@ public struct BambuModelConfig: Sendable, Hashable {
                         state = 3 + e
                     }
                 }
-                states.append(state)
+                if state >= 1 {
+                    counts[state, default: 0] += 1
+                }
             } else {
                 _ = read(2) // special_side
                 for _ in 0 ... nss {
@@ -180,13 +188,17 @@ public struct BambuModelConfig: Sendable, Hashable {
             }
         }
         decode(depth: 0)
-        let painted = states.filter { $0 >= 1 }
-        guard !painted.isEmpty else { return 0 }
-        var counts: [Int: Int] = [:]
-        for s in painted {
-            counts[s, default: 0] += 1
-        }
         return counts.max { $0.value < $1.value }?.key ?? 0
+    }
+
+    @inline(__always)
+    private static func hexNibble(_ byte: UInt8) -> Int? {
+        switch byte {
+        case 0x30 ... 0x39: Int(byte - 0x30)
+        case 0x41 ... 0x46: Int(byte - 0x41 + 10)
+        case 0x61 ... 0x66: Int(byte - 0x61 + 10)
+        default: nil
+        }
     }
 
     /// Parses `#RRGGBB` / `#RRGGBBAA` into RGBA 0...1. Returns nil on malformed input.

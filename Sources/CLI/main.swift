@@ -32,13 +32,14 @@ do {
             exit(2)
         }
         let size = try CLI.resolveSize(from: cliArgs)
+        let plate = try CLI.resolvePlate(from: cliArgs)
         let useCache = cliArgs.contains("--cache")
         try CLI.thumbnail(
             input: URL(fileURLWithPath: cliArgs[2]),
             output: URL(fileURLWithPath: cliArgs[3]),
             size: size,
             useCache: useCache,
-            plate: CLI.parsePlate(from: cliArgs)
+            plate: plate
         )
     case "batch":
         guard cliArgs.count >= 4 else {
@@ -66,6 +67,9 @@ do {
         CLI.printUsage()
         exit(2)
     }
+} catch let error as CLIError where error.isUsageError {
+    FileHandle.standardError.write(Data("error: \(error.localizedDescription)\n".utf8))
+    exit(2)
 } catch {
     FileHandle.standardError.write(Data("error: \(error.localizedDescription)\n".utf8))
     exit(1)

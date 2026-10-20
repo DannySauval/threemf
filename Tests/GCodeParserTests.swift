@@ -1,5 +1,8 @@
 import simd
 import XCTest
+#if canImport(ThreeMFCore)
+    @testable import ThreeMFCore
+#endif
 
 final class GCodeParserTests: XCTestCase {
     private func writeTempFile(string: String) throws -> URL {
@@ -309,5 +312,61 @@ final class GCodeParserTests: XCTestCase {
         // G3 CCW from (0,0)→(10,0) around (5,0) sweeps through negative Y.
         let midY = toolpath.segments.dropFirst().map(\.end.y).min() ?? 0
         XCTAssertLessThan(midY, -1)
+    }
+
+    func testParse_g92ExtruderReset_allowsSubsequentM82Extrusion() throws {
+        // Slicers in M82 (absolute E) mode prime to E20, then emit `G92 E0` before printing.
+        let gcode = """
+        G0 X0 Y0 Z0.2 F600
+        G1 X10 Y0 E20
+        G92 E0
+        G1 X20 Y0 E0.5
+        """
+        let url = try writeTempFile(string: gcode)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let toolpath = try GCodeParser.parse(from: url)
+        XCTAssertEqual(toolpath.segments.count, 3)
+        XCTAssertTrue(toolpath.segments[1].extrudes)
+        XCTAssertTrue(toolpath.segments[2].extrudes)
+        XCTAssertEqual(toolpath.totalExtrudedMM, 20, accuracy: 0.001)
+    }
+
+    func testParse_parenthesizedComments_ignoredInline() throws {
+        let gcode = """
+        (header comment with X999 E999)
+        G0 X0 (skip X500) Y0 Z0.2
+        G1 X10 (comment E-50 Y999) Y0 E1
+        """
+        let url = try writeTempFile(string: gcode)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let toolpath = try GCodeParser.parse(from: url)
+        XCTAssertEqual(toolpath.segments.count, 2)
+        XCTAssertEqual(toolpath.segments[1].end.x, 10, accuracy: 0.001)
+        XCTAssertEqual(toolpath.segments[1].end.y, 0, accuracy: 0.001)
+        XCTAssertTrue(toolpath.segments[1].extrudes)
+    }
+
+    func testParse_startupLiftAndZHop_doNotCollapseOrInflateLayers() throws {
+        // Homing lift G0 Z10 before layer 1 (Z0.2), plus a Z-hop to Z0.6 mid-layer 1.
+        let gcode = """
+        G0 X0 Y0 Z10
+        G0 X0 Y0 Z0.2
+        G1 X10 Y0 E1
+        G0 X10 Y0 Z0.6
+        G0 X10 Y10 Z0.6
+        G0 X10 Y10 Z0.2
+        G1 X0 Y10 E2
+        G0 X0 Y10 Z0.4
+        G1 X0 Y0 E3
+        """
+        let url = try writeTempFile(string: gcode)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let toolpath = try GCodeParser.parse(from: url)
+        XCTAssertEqual(toolpath.layerCount, 2)
+        let extrudeLayers = toolpath.segments.filter(\.extrudes).map(\.layerIndex)
+        XCTAssertEqual(extrudeLayers, [0, 0, 1])
     }
 }

@@ -1,6 +1,9 @@
 import Foundation
 import Testing
 import ZIPFoundation
+#if canImport(ThreeMFCore)
+    @testable import ThreeMFCore
+#endif
 
 /// `listPlates` must return one entry per *real* plate. Bambu emits several PNGs per plate
 /// (`plate_<N>.png`, `plate_<N>_small.png`, `plate_no_light_<N>.png`, `top_<N>.png`); only the

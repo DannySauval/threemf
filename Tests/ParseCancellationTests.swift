@@ -1,6 +1,9 @@
 import os
 import simd
 import XCTest
+#if canImport(ThreeMFCore)
+    @testable import ThreeMFCore
+#endif
 
 /// Covers cooperative cancellation: a cancelled token must abort a parse with
 /// `CancellationError` instead of running to completion and discarding the result.

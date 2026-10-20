@@ -1,4 +1,7 @@
 import XCTest
+#if canImport(ThreeMFCore)
+    @testable import ThreeMFCore
+#endif
 
 final class SafePNGValidatorTests: XCTestCase {
     private let tinyPNG = TestPNG.tiny1x1

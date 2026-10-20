@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import ImageIO
 import SceneKit
 import simd
 #if canImport(ThreeMFCore)
@@ -10,9 +11,21 @@ enum CLIError: Error, LocalizedError {
     case unsupportedFormat(String)
     case fileNotFound(String)
     case invalidSize(String)
+    case invalidPlate(String)
+    case invalidBatchAction(String)
     case batchValidationFailed
     case thumbnailEncodingFailed
     case rendererCreationFailed
+
+    var isUsageError: Bool {
+        switch self {
+        case .invalidSize, .invalidPlate, .invalidBatchAction:
+            true
+        case .unsupportedFormat, .fileNotFound, .batchValidationFailed,
+             .thumbnailEncodingFailed, .rendererCreationFailed:
+            false
+        }
+    }
 
     var errorDescription: String? {
         switch self {
@@ -23,6 +36,10 @@ enum CLIError: Error, LocalizedError {
             "File not found: \(path)"
         case let .invalidSize(detail):
             "Invalid --size value: \(detail)"
+        case let .invalidPlate(detail):
+            "Invalid --plate value: \(detail)"
+        case let .invalidBatchAction(action):
+            "Unknown batch action: \(action) (expected 'info' or 'validate')"
         case .batchValidationFailed:
             "One or more files failed validation"
         case .thumbnailEncodingFailed:
@@ -66,27 +83,31 @@ enum CLI {
     }
 
     /// Runs `info` or `validate` across many files concurrently. Output is JSONL for info
-    /// and PASS/FAIL lines for validate. Exits non-zero if any file fails to parse.
+    /// and PASS/FAIL lines for validate, emitted in deterministic input order.
+    /// Exits non-zero if any file fails to parse.
     /// In-flight work is capped at `max(1, activeProcessorCount)` so a huge batch cannot
     /// spawn one task per file immediately.
     static func batch(action: String, files: [URL]) async throws {
+        guard action == "info" || action == "validate" else {
+            throw CLIError.invalidBatchAction(action)
+        }
         var anyFailed = false
         let concurrency = max(1, ProcessInfo.processInfo.activeProcessorCount)
-        await withTaskGroup(of: String?.self) { group in
+        await withTaskGroup(of: (Int, String, Bool).self) { group in
             var nextIndex = 0
 
             func enqueueNext() {
                 guard nextIndex < files.count else { return }
-                let file = files[nextIndex]
+                let idx = nextIndex
+                let file = files[idx]
                 nextIndex += 1
                 group.addTask {
-                    switch action {
-                    case "info":
-                        await Self.infoLine(for: file)
-                    case "validate":
-                        await Self.validateLine(for: file)
-                    default:
-                        nil
+                    if action == "info" {
+                        let (line, failed) = await Self.infoLine(for: file)
+                        return (idx, line, failed)
+                    } else {
+                        let (line, failed) = await Self.validateLine(for: file)
+                        return (idx, line, failed)
                     }
                 }
             }
@@ -94,12 +115,17 @@ enum CLI {
             for _ in 0 ..< min(concurrency, files.count) {
                 enqueueNext()
             }
-            for await line in group {
-                if let line {
-                    if line.hasPrefix("FAIL ") {
+
+            var nextToWrite = 0
+            var pending: [Int: (line: String, failed: Bool)] = [:]
+            for await (idx, line, failed) in group {
+                pending[idx] = (line, failed)
+                while let ready = pending.removeValue(forKey: nextToWrite) {
+                    if ready.failed {
                         anyFailed = true
                     }
-                    FileHandle.standardOutput.write(Data("\(line)\n".utf8))
+                    FileHandle.standardOutput.write(Data("\(ready.line)\n".utf8))
+                    nextToWrite += 1
                 }
                 enqueueNext()
             }
@@ -109,7 +135,7 @@ enum CLI {
         }
     }
 
-    private static func infoLine(for file: URL) async -> String? {
+    private static func infoLine(for file: URL) async -> (line: String, failed: Bool) {
         do {
             try ensureExists(file)
             let format = try resolveFormat(file)
@@ -117,9 +143,15 @@ enum CLI {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.sortedKeys]
             let data = try encoder.encode(payload)
-            return String(data: data, encoding: .utf8)
+            if let text = String(data: data, encoding: .utf8) {
+                return (text, false)
+            }
+            return (encodeInfoErrorLine(fileName: file.lastPathComponent, message: "UTF-8 encode failed"), true)
         } catch {
-            return encodeInfoErrorLine(fileName: file.lastPathComponent, message: error.localizedDescription)
+            return (
+                encodeInfoErrorLine(fileName: file.lastPathComponent, message: error.localizedDescription),
+                true
+            )
         }
     }
 
@@ -140,7 +172,7 @@ enum CLI {
         return line
     }
 
-    private static func validateLine(for file: URL) async -> String? {
+    private static func validateLine(for file: URL) async -> (line: String, failed: Bool) {
         do {
             try ensureExists(file)
             let format = try resolveFormat(file)
@@ -148,9 +180,9 @@ enum CLI {
             case .gcode: _ = try GCodeParser.parse(from: file)
             case .threemf, .stl: _ = try loadMesh(from: file, format: format)
             }
-            return "PASS \(file.lastPathComponent)"
+            return ("PASS \(file.lastPathComponent)", false)
         } catch {
-            return "FAIL \(file.lastPathComponent): \(error.localizedDescription)"
+            return ("FAIL \(file.lastPathComponent): \(error.localizedDescription)", true)
         }
     }
 
@@ -204,12 +236,21 @@ enum CLI {
         return n
     }
 
+    /// Resolves the optional `--plate N` (1-based) flag from argv.
+    /// Absent → `nil`. Present with missing, non-numeric, or `< 1` value → throws `CLIError.invalidPlate`.
+    static func resolvePlate(from args: [String]) throws -> Int? {
+        guard let idx = args.firstIndex(of: "--plate") else { return nil }
+        guard idx + 1 < args.count else { throw CLIError.invalidPlate("(missing value)") }
+        let raw = args[idx + 1]
+        guard let n = Int(raw), n >= 1 else {
+            throw CLIError.invalidPlate("\(raw) (expected an integer >= 1)")
+        }
+        return n
+    }
+
     /// Parses optional `--plate N` (1-based) flag from argv. Returns nil if absent or invalid.
     static func parsePlate(from args: [String]) -> Int? {
-        guard let idx = args.firstIndex(of: "--plate"), idx + 1 < args.count else {
-            return nil
-        }
-        return Int(args[idx + 1])
+        try? resolvePlate(from: args)
     }
 
     // MARK: - Commands
@@ -285,25 +326,36 @@ enum CLI {
     static func thumbnail(input: URL, output: URL, size: Int, useCache: Bool = false, plate: Int? = nil) throws {
         try ensureExists(input)
 
-        // Cache hit: write the cached PNG directly. (Skipped when a specific plate is
-        // requested — the cache is keyed by file only, not by plate.)
-        if useCache, plate == nil, let cached = ThumbnailCache.cachedThumbnail(for: input) {
+        // Include size and plate in the cache key so different sizes/plates don't alias.
+        let cacheExtraKey = "size=\(size):plate=\(plate ?? 0)"
+        if useCache, let cached = ThumbnailCache.cachedThumbnail(for: input, extraKey: cacheExtraKey) {
             try cached.write(to: output, options: .atomic)
             return
         }
 
         let format = try resolveFormat(input)
-        var mesh = try loadMesh(from: input, format: format)
-        // `--plate N` (1-based) renders only that plate of a multi-plate Bambu/Orca 3MF.
-        if let plate, !mesh.plates.isEmpty {
-            let idx = max(0, min(plate - 1, mesh.plates.count - 1))
-            mesh = mesh.submesh(plateIndex: idx)
+        let scene: SCNScene
+        switch format {
+        case .gcode:
+            let toolpath = try GCodeParser.parse(
+                from: input,
+                outputSegmentBudget: GCodeParser.thumbnailSegmentBudget,
+                computesStatistics: false
+            )
+            scene = ToolpathSceneBuilder.buildTopDownScene(from: toolpath)
+        case .threemf, .stl:
+            var mesh = try loadMesh(from: input, format: format)
+            // `--plate N` (1-based) renders only that plate of a multi-plate Bambu/Orca 3MF.
+            if let plate, !mesh.plates.isEmpty {
+                let idx = max(0, min(plate - 1, mesh.plates.count - 1))
+                mesh = mesh.submesh(plateIndex: idx)
+            }
+            scene = SceneBuilder.buildScene(from: mesh)
         }
-        let scene = SceneBuilder.buildScene(from: mesh)
 
         let renderer = SCNRenderer(device: nil, options: nil)
         renderer.scene = scene
-        // Pick the camera node SceneBuilder added so the framing is correct.
+        // Pick the camera node SceneBuilder/ToolpathSceneBuilder added so framing is correct.
         if let cam = scene.rootNode.childNode(withName: "camera", recursively: true) {
             renderer.pointOfView = cam
         }
@@ -311,17 +363,32 @@ enum CLI {
         let pixelSize = CGSize(width: size, height: size)
         let image = renderer.snapshot(atTime: 0, with: pixelSize, antialiasingMode: .multisampling2X)
 
-        guard let tiff = image.tiffRepresentation,
-              let rep = NSBitmapImageRep(data: tiff),
-              let png = rep.representation(using: .png, properties: [:])
-        else {
+        guard let png = encodePNG(image) else {
             throw CLIError.thumbnailEncodingFailed
         }
 
         try png.write(to: output, options: .atomic)
         if useCache {
-            ThumbnailCache.store(png, for: input)
+            ThumbnailCache.store(png, for: input, extraKey: cacheExtraKey)
         }
+    }
+
+    private static func encodePNG(_ image: NSImage) -> Data? {
+        if let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+            let buffer = NSMutableData()
+            if let dest = CGImageDestinationCreateWithData(buffer, "public.png" as CFString, 1, nil) {
+                CGImageDestinationAddImage(dest, cg, nil)
+                if CGImageDestinationFinalize(dest) {
+                    return buffer as Data
+                }
+            }
+        }
+        guard let tiff = image.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiff)
+        else {
+            return nil
+        }
+        return rep.representation(using: .png, properties: [:])
     }
 
     // MARK: - Helpers

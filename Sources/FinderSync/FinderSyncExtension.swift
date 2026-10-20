@@ -32,18 +32,12 @@ final class FinderSyncExtension: FIFinderSync {
     }
 
     override func menu(for menuKind: FIMenuKind) -> NSMenu? {
-        guard menuKind == .contextualMenuForItems else { return nil }
-        guard let selected = FIFinderSyncController.default().selectedItemURLs(),
+        guard menuKind == .contextualMenuForItems, let selected = FIFinderSyncController.default().selectedItemURLs(),
               !selected.isEmpty,
               selected.allSatisfy({ url in
                   let ext = url.pathExtension.lowercased()
                   return ext == "3mf" || ext == "stl" || ext == "gcode"
-              })
-        else {
-            return nil
-        }
-
-        guard !slicers.isEmpty else { return nil }
+              }), !slicers.isEmpty else { return nil }
 
         let menu = NSMenu(title: "")
         for slicer in slicers {

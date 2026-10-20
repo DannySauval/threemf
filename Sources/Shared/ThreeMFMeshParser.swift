@@ -124,8 +124,7 @@ public enum ThreeMFMeshParser {
         let archive = try Archive(url: fileURL, accessMode: .read)
         let budget = ExtractionBudget(limits.maxModelExtractBytes)
         for path in modelPaths {
-            guard let entry = archive[path] else { continue }
-            guard let data = try? extractCapped(
+            guard let entry = archive[path], let data = try? extractCapped(
                 archive,
                 entry: entry,
                 cap: limits.maxModelExtractBytes,
@@ -214,16 +213,21 @@ public enum ThreeMFMeshParser {
         // Per-object Bambu paint states (merged from component files below).
         var objectPaintStates = result.objectPaintStates
 
-        // Build set of object IDs actually needed by build items
-        // to avoid extracting/parsing large files we won't use
+        // Build set of object IDs actually needed by build items (transitively across
+        // nested <component> chains up to maxComponentDepth) to avoid extracting/parsing
+        // large files we won't use while still resolving multi-level assemblies.
         let neededObjectIds: Set<String>
         if !result.buildItems.isEmpty {
-            var needed = Set<String>()
-            for item in result.buildItems {
-                needed.insert(item.objectId)
-                // Also include components referenced by build item objects
-                for comp in result.components where comp.parentObjectId == item.objectId {
-                    needed.insert(comp.objectId)
+            var needed = Set<String>(result.buildItems.map(\.objectId))
+            for _ in 0 ..< maxComponentDepth {
+                var added = false
+                for comp in result.components where needed.contains(comp.parentObjectId) {
+                    if needed.insert(comp.objectId).inserted {
+                        added = true
+                    }
+                }
+                if !added {
+                    break
                 }
             }
             neededObjectIds = needed
@@ -288,15 +292,30 @@ public enum ThreeMFMeshParser {
                         progress?(0.4 + 0.4 * scanFraction)
                     }
                     try cancellation?.check()
-                    if let firstMesh = compResult.objectMeshes.first {
-                        objectMeshes[comp.objectId] = firstMesh.value
-                        remainingScanVertices = max(0, remainingScanVertices - firstMesh.value.vertices.count)
+                    // Import all objects discovered in this external .model file so sibling
+                    // <component> references into the same file reuse them without re-extracting.
+                    for key in compResult.objectMeshes.keys.sorted() {
+                        guard let meshVal = compResult.objectMeshes[key] else { continue }
+                        if objectMeshes[key] == nil {
+                            objectMeshes[key] = meshVal
+                        }
+                        if let paint = compResult.objectPaintStates[key], objectPaintStates[key] == nil {
+                            objectPaintStates[key] = paint
+                        }
+                        remainingScanVertices = max(0, remainingScanVertices - meshVal.vertices.count)
                         remainingScanTriangles = max(
                             0,
-                            remainingScanTriangles - (firstMesh.value.indices.count / 3)
+                            remainingScanTriangles - (meshVal.indices.count / 3)
                         )
-                        // Carry the component's paint states under the referencing object id.
-                        if let paint = compResult.objectPaintStates[firstMesh.key] {
+                    }
+                    // If the external file used a different internal <object id> than the
+                    // referencing component's objectId, alias it deterministically.
+                    if objectMeshes[comp.objectId] == nil,
+                       let fallbackKey = compResult.objectMeshes.keys.min(),
+                       let fallbackMesh = compResult.objectMeshes[fallbackKey]
+                    {
+                        objectMeshes[comp.objectId] = fallbackMesh
+                        if let paint = compResult.objectPaintStates[fallbackKey] {
                             objectPaintStates[comp.objectId] = paint
                         }
                     }
@@ -327,7 +346,7 @@ public enum ThreeMFMeshParser {
         // Per-triangle plate index, populated only for multi-plate Bambu/Orca files.
         var allTrianglePlates: [Int] = []
 
-        /// Aggregate caps to bound memory.
+        // Aggregate caps to bound memory.
         func canAppend(verts: Int, tris: Int) -> Bool {
             allVertices.count + verts <= limits.maxVertices
                 && (allIndices.count / 3) + tris <= limits.maxTriangles
@@ -384,7 +403,9 @@ public enum ThreeMFMeshParser {
                     // fall back to the mesh's own core-spec per-triangle materials.
                     if bambuColor {
                         // Base color = object's extruder; per-triangle paint overrides it.
-                        let baseMatIdx = bambuObjMaterial[item.objectId] ?? -1
+                        let baseMatIdx = bambuObjMaterial[item.objectId]
+                            ?? bambuObjMaterial[emission.meshObjectId]
+                            ?? -1
                         if allTriangleMats.count < triBase {
                             allTriangleMats.append(contentsOf: repeatElement(
                                 -1,
@@ -415,7 +436,9 @@ public enum ThreeMFMeshParser {
                     }
                     // Plate membership (independent of color) so the preview can show one plate.
                     if bambuHasPlates {
-                        let plateIdx = bambuObjPlate[item.objectId] ?? -1
+                        let plateIdx = bambuObjPlate[item.objectId]
+                            ?? bambuObjPlate[emission.meshObjectId]
+                            ?? -1
                         if allTrianglePlates.count < triBase {
                             allTrianglePlates.append(contentsOf: repeatElement(
                                 -1,
@@ -430,8 +453,8 @@ public enum ThreeMFMeshParser {
             // Sort for deterministic display order across launches.
             for objId in objectMeshes.keys.sorted() {
                 try cancellation?.check()
-                guard let mesh = objectMeshes[objId] else { continue }
-                guard canAppend(verts: mesh.vertices.count, tris: mesh.indices.count / 3) else { continue }
+                guard let mesh = objectMeshes[objId],
+                      canAppend(verts: mesh.vertices.count, tris: mesh.indices.count / 3) else { continue }
                 let baseOffset = UInt32(allVertices.count)
                 let triBase = allIndices.count / 3
                 allVertices.append(contentsOf: mesh.vertices)
@@ -509,15 +532,53 @@ public enum ThreeMFMeshParser {
         return mesh
     }
 
-    /// True when `xmlData` contains a `<!DOCTYPE` or `<!ENTITY` declaration (case-insensitive).
+    /// True when `xmlData` contains a `<!DOCTYPE` or `<!ENTITY` declaration (case-insensitive),
+    /// across UTF-8, Latin-1, and UTF-16/UTF-32 (interleaved zero bytes).
     /// NSXMLParser expands *internal* entities even with `shouldResolveExternalEntities = false`,
     /// so any DTD/entity declaration is refused before parse rather than risk an entity bomb.
-    private static func containsDTDOrEntityDeclaration(_ xmlData: Data) -> Bool {
-        guard let text = String(data: xmlData, encoding: .utf8)
-            ?? String(data: xmlData, encoding: .isoLatin1)
-        else { return false }
-        return text.range(of: "<!DOCTYPE", options: .caseInsensitive) != nil
-            || text.range(of: "<!ENTITY", options: .caseInsensitive) != nil
+    static func containsDTDOrEntityDeclaration(_ xmlData: Data) -> Bool {
+        xmlData.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                return false
+            }
+            let count = raw.count
+            let doctype: [UInt8] = [0x21, 0x64, 0x6F, 0x63, 0x74, 0x79, 0x70, 0x65] // !doctype
+            let entity: [UInt8] = [0x21, 0x65, 0x6E, 0x74, 0x69, 0x74, 0x79] // !entity
+            var i = 0
+            while i < count {
+                if base[i] == 0x3C { // '<'
+                    if matchesASCIIIgnoringNulls(base: base, count: count, after: i + 1, lowercaseTarget: doctype)
+                        || matchesASCIIIgnoringNulls(base: base, count: count, after: i + 1, lowercaseTarget: entity)
+                    {
+                        return true
+                    }
+                }
+                i += 1
+            }
+            return false
+        }
+    }
+
+    private static func matchesASCIIIgnoringNulls(
+        base: UnsafePointer<UInt8>,
+        count: Int,
+        after start: Int,
+        lowercaseTarget: [UInt8]
+    ) -> Bool {
+        var pos = start
+        for expected in lowercaseTarget {
+            var zeros = 0
+            while pos < count, base[pos] == 0x00, zeros < 4 {
+                pos += 1
+                zeros += 1
+            }
+            guard pos < count else { return false }
+            let b = base[pos]
+            let lower = (b >= 0x41 && b <= 0x5A) ? (b + 32) : b
+            guard lower == expected else { return false }
+            pos += 1
+        }
+        return true
     }
 
     /// Runs `XMLParser` (NSXMLParser) over the root model file to recover vertices and

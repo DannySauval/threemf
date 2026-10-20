@@ -225,8 +225,7 @@ public enum ThreeMFExtractor {
             "Metadata/plate_\(plateIndex)/plate_\(plateIndex).json",
         ]
         for path in candidatePaths {
-            guard let entry = archive[path] else { continue }
-            guard entry.uncompressedSize <= UInt64(maxThumbnailSize) else { continue }
+            guard let entry = archive[path], entry.uncompressedSize <= UInt64(maxThumbnailSize) else { continue }
             var data = Data()
             do {
                 _ = try archive.extract(entry) { chunk in

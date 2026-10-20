@@ -2,6 +2,9 @@ import os
 import SceneKit
 import simd
 import XCTest
+#if canImport(ThreeMFCore)
+    @testable import ThreeMFCore
+#endif
 
 class STLParserTests: XCTestCase {
     // MARK: - Binary STL

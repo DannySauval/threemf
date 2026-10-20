@@ -17,10 +17,13 @@ enum SafePNGValidator {
             throw ValidationError.invalidImage
         }
         let options = [kCGImageSourceShouldCache: false] as CFDictionary
-        guard let source = CGImageSourceCreateWithData(data as CFData, options) else {
-            throw ValidationError.invalidImage
-        }
-        guard let props = CGImageSourceCopyPropertiesAtIndex(source, 0, options) as? [CFString: Any] else {
+        guard let source = CGImageSourceCreateWithData(data as CFData, options),
+              let props = CGImageSourceCopyPropertiesAtIndex(
+                  source,
+                  0,
+                  options
+              ) as? [CFString: Any]
+        else {
             throw ValidationError.invalidImage
         }
         let width = (props[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue ?? 0

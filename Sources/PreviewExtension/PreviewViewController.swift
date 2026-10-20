@@ -36,6 +36,7 @@ class PreviewViewController: NSViewController, @preconcurrency QLPreviewingContr
     private weak var scnView: ZoomSCNView?
     private weak var hudView: HUDOverlay?
     private weak var helpView: HelpOverlay?
+    private weak var helpClickRecognizer: NSClickGestureRecognizer?
     /// Embedded plate thumbnails (Bambu/Orca 3MFs). Empty for non-plate files.
     private var plates: [ThreeMFExtractor.PlateThumbnail] = []
     private var currentPlateIndex: Int = 0
@@ -69,6 +70,11 @@ class PreviewViewController: NSViewController, @preconcurrency QLPreviewingContr
         endPreviewLoad()
         animationTask?.cancel()
         animationTask = nil
+        if let recognizer = helpClickRecognizer {
+            view.removeGestureRecognizer(recognizer)
+            helpClickRecognizer = nil
+        }
+        helpView = nil
         view.subviews.forEach { $0.removeFromSuperview() }
         axisGizmoNode = nil
         bedGridNode = nil
@@ -693,13 +699,15 @@ class PreviewViewController: NSViewController, @preconcurrency QLPreviewingContr
     private func makeStats(for mesh: MeshData) -> HUDStats {
         // Single-walk bbox+volume — avoids two O(N) passes over `vertices`.
         let stats = mesh.statistics()
-        // Bambu/Orca plate JSON keyed by the currently-selected plate index (1-based).
-        // Always falls back to nil when not a Bambu file or JSON missing.
+        // Bambu/Orca plate JSON keyed by the currently-selected plate ID (1-based).
+        // Works for both <2MB auto-loaded 3D scenes and >=2MB thumbnail-first scenes.
+        let plateNumber = meshPlates[safe: currentPlateIndex]?.id
+            ?? plates[safe: currentPlateIndex]?.index
+            ?? 1
         let plateInfo: BambuPlateInfo? = if let url = fileURL,
-                                            !plates.isEmpty,
-                                            let idx = plates[safe: currentPlateIndex]?.index
+                                            url.pathExtension.lowercased() == "3mf"
         {
-            ThreeMFExtractor.extractPlateInfo(plateIndex: idx, from: url)
+            ThreeMFExtractor.extractPlateInfo(plateIndex: plateNumber, from: url)
         } else {
             nil
         }
@@ -777,19 +785,20 @@ class PreviewViewController: NSViewController, @preconcurrency QLPreviewingContr
     // MARK: - Wireframe toggle
 
     private func toggleWireframe() {
-        guard let scene = scnView?.scene else { return }
-        // Find the first geometry node in the scene (the one added by SceneBuilder).
-        scene.rootNode.enumerateChildNodes { node, _ in
-            guard let geometry = node.geometry else { return }
-            let current = geometry.materials.first?.fillMode ?? .fill
-            let next: SCNFillMode = (current == .fill) ? .lines : .fill
-            for material in geometry.materials {
-                material.fillMode = next
-                // Wireframe over Phong is hard to read against dark backgrounds —
-                // switch to constant lighting so lines render at full diffuse color
-                // regardless of normal/light geometry. Restore on toggle off.
-                material.lightingModel = (next == .lines) ? .constant : .phong
-            }
+        // Wireframe only applies to triangle meshes, not G-code line toolpaths or helpers.
+        guard loadedToolpath == nil,
+              let scene = scnView?.scene,
+              let modelNode = scene.rootNode.childNode(withName: "model", recursively: false),
+              let geometry = modelNode.geometry
+        else { return }
+        let current = geometry.materials.first?.fillMode ?? .fill
+        let next: SCNFillMode = (current == .fill) ? .lines : .fill
+        for material in geometry.materials {
+            material.fillMode = next
+            // Wireframe over Phong is hard to read against dark backgrounds —
+            // switch to constant lighting so lines render at full diffuse color
+            // regardless of normal/light geometry. Restore on toggle off.
+            material.lightingModel = (next == .lines) ? .constant : .phong
         }
         log.debug("wireframe toggled")
     }
@@ -800,10 +809,34 @@ class PreviewViewController: NSViewController, @preconcurrency QLPreviewingContr
         case top, bottom, front, back, left, right
     }
 
+    /// Normalized world-space half-extents of the currently displayed mesh or toolpath
+    /// (after the -90° X rotation from 3D-print Z-up into SceneKit Y-up).
+    private func currentWorldHalfExtents() -> simd_float3 {
+        if let scene = scnView?.scene,
+           let modelNode = scene.rootNode.childNode(withName: "model", recursively: false)
+        {
+            let (minB, maxB) = modelNode.boundingBox
+            let sx = Float(maxB.x - minB.x)
+            let sy = Float(maxB.y - minB.y)
+            let sz = Float(maxB.z - minB.z)
+            let maxDim = max(sx, max(sy, sz))
+            guard maxDim > 0 else { return simd_float3(1, 1, 1) }
+            let scale: Float = 2.0 / maxDim
+            return simd_float3(sx, sz, sy) * (0.5 * scale)
+        }
+        if let toolpath = loadedToolpath {
+            let dims = toolpath.boundingBox.max - toolpath.boundingBox.min
+            let maxDim = max(dims.x, max(dims.y, dims.z))
+            guard maxDim > 0 else { return simd_float3(1, 1, 1) }
+            let scale: Float = 2.0 / maxDim
+            return simd_float3(dims.x, dims.z, dims.y) * (0.5 * scale)
+        }
+        return simd_float3(1, 1, 1)
+    }
+
     private func setCameraPreset(_ preset: CameraPreset) {
         guard let scnView, let cameraNode = scnView.pointOfView else { return }
-        // Models are normalized to ±1; match opening-camera fill/FOV from SceneBuilder.
-        let halfExtents = simd_float3(1, 1, 1)
+        let halfExtents = currentWorldHalfExtents()
         let direction = switch preset {
         case .top: simd_float3(0, 1, 0.001)
         case .bottom: simd_float3(0, -1, 0.001)
@@ -823,6 +856,7 @@ class PreviewViewController: NSViewController, @preconcurrency QLPreviewingContr
         let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         SCNTransaction.begin()
         SCNTransaction.animationDuration = reduceMotion ? 0 : 0.4
+        cameraNode.camera?.fieldOfView = 45
         cameraNode.position = position
         cameraNode.look(at: SCNVector3(0, 0, 0))
         SCNTransaction.commit()
@@ -859,6 +893,10 @@ class PreviewViewController: NSViewController, @preconcurrency QLPreviewingContr
         if let existing = helpView {
             existing.removeFromSuperview()
             helpView = nil
+            if let recognizer = helpClickRecognizer {
+                view.removeGestureRecognizer(recognizer)
+                helpClickRecognizer = nil
+            }
             return
         }
         let help = HelpOverlay()
@@ -876,6 +914,7 @@ class PreviewViewController: NSViewController, @preconcurrency QLPreviewingContr
         click.delaysPrimaryMouseButtonEvents = false
         help.addGestureRecognizer(NSClickGestureRecognizer()) // swallow clicks on the overlay
         view.addGestureRecognizer(click)
+        helpClickRecognizer = click
         helpView = help
     }
 
@@ -888,6 +927,7 @@ class PreviewViewController: NSViewController, @preconcurrency QLPreviewingContr
             help.removeFromSuperview()
             helpView = nil
             view.removeGestureRecognizer(recognizer)
+            helpClickRecognizer = nil
         }
     }
 
@@ -899,9 +939,14 @@ class PreviewViewController: NSViewController, @preconcurrency QLPreviewingContr
         }
         guard let scene = scnView?.scene else { return }
         let node = SceneBuilder.makeAxisGizmoNode()
-        // Pin to lower-right corner regardless of camera orbit by attaching to camera.
-        if let camera = scene.rootNode.childNode(withName: "camera", recursively: true) {
+        // Pin position to lower-right corner of the active camera while locking world
+        // orientation so the gizmo arrows rotate live as the user orbits the model.
+        if let camera = scnView?.pointOfView ?? scene.rootNode.childNode(withName: "camera", recursively: true) {
             node.position = SCNVector3(0.7, -0.55, -2)
+            let worldAligned = SCNTransformConstraint.orientationConstraint(inWorldSpace: true) { _, _ in
+                SCNQuaternion(0, 0, 0, 1)
+            }
+            node.constraints = [worldAligned]
             camera.addChildNode(node)
         } else {
             scene.rootNode.addChildNode(node)
@@ -916,7 +961,8 @@ class PreviewViewController: NSViewController, @preconcurrency QLPreviewingContr
             return
         }
         guard let scene = scnView?.scene else { return }
-        let node = SceneBuilder.makeBedGridNode()
+        let yOffset = -currentWorldHalfExtents().y
+        let node = SceneBuilder.makeBedGridNode(yOffset: yOffset)
         scene.rootNode.addChildNode(node)
         bedGridNode = node
     }

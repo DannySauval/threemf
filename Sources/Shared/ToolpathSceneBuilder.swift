@@ -52,7 +52,8 @@ public enum ToolpathSceneBuilder {
 
         // Camera (3/4 view, matching SceneBuilder.buildScene defaults) with the same
         // silhouette-fitted distance so framing is consistent across mesh and toolpath.
-        let halfExtents = dims * (0.5 * normalizeScale)
+        // After -90° X rotation, toolpath Z-up maps to world Y and toolpath Y maps to world Z.
+        let halfExtents = simd_float3(dims.x, dims.z, dims.y) * (0.5 * normalizeScale)
         let cameraNode = SCNNode()
         cameraNode.name = "camera"
         cameraNode.camera = SCNCamera()
@@ -87,7 +88,16 @@ public enum ToolpathSceneBuilder {
     ) -> SCNScene {
         let scene = buildScene(from: toolpath, colorMode: colorMode)
         if let cam = scene.rootNode.childNode(withName: "camera", recursively: true) {
-            cam.position = SCNVector3(0, 5, 0.001)
+            let dims = toolpath.boundingBox.max - toolpath.boundingBox.min
+            let maxDim = max(dims.x, max(dims.y, dims.z))
+            let normalizeScale: Float = maxDim > 0 ? 2.0 / maxDim : 1.0
+            let halfExtents = simd_float3(dims.x, dims.z, dims.y) * (0.5 * normalizeScale)
+            cam.position = SceneBuilder.fittedCameraPosition(
+                halfExtents: halfExtents,
+                direction: simd_float3(0, 1, 0.001),
+                fovDegrees: 45,
+                fill: 0.9
+            )
             cam.look(at: SCNVector3(0, 0, 0))
         }
         return scene
@@ -108,7 +118,7 @@ public enum ToolpathSceneBuilder {
         toolpath: ToolpathData
     ) {
         let layerCount = max(1, toolpath.layerCount)
-        let (minFeed, maxFeed) = feedrateBounds(toolpath.segments)
+        let (minFeed, maxFeed) = feedrateBounds(toolpath.segments, for: colorMode)
         let grouped = segmentsByLayer(toolpath.segments)
         for child in modelNode.childNodes {
             guard let idx = layerIndex(from: child) else { continue }
@@ -137,7 +147,7 @@ public enum ToolpathSceneBuilder {
         } else {
             toolpath.segments
         }
-        let (minFeed, maxFeed) = feedrateBounds(filtered)
+        let (minFeed, maxFeed) = feedrateBounds(filtered, for: colorMode)
         return makeGeometry(
             segments: filtered,
             colorMode: colorMode,
@@ -153,7 +163,7 @@ public enum ToolpathSceneBuilder {
         colorMode: ColorMode
     ) {
         let layerCount = max(1, toolpath.layerCount)
-        let (minFeed, maxFeed) = feedrateBounds(toolpath.segments)
+        let (minFeed, maxFeed) = feedrateBounds(toolpath.segments, for: colorMode)
         let grouped = segmentsByLayer(toolpath.segments)
         for layerIndex in grouped.keys.sorted() {
             let segs = grouped[layerIndex] ?? []
@@ -179,9 +189,28 @@ public enum ToolpathSceneBuilder {
         return grouped
     }
 
-    private static func feedrateBounds(_ segments: [ToolpathSegment]) -> (Float, Float) {
-        let maxFeed = segments.map(\.feedrate).max() ?? 1
-        let minFeed = segments.map(\.feedrate).filter { $0 > 0 }.min() ?? 1
+    private static func feedrateBounds(
+        _ segments: [ToolpathSegment],
+        for colorMode: ColorMode
+    ) -> (Float, Float) {
+        guard colorMode == .feedrate else { return (1, 1) }
+        var minFeed = Float.infinity
+        var maxFeed: Float = 0
+        for seg in segments {
+            let f = seg.feedrate
+            if f > maxFeed {
+                maxFeed = f
+            }
+            if f > 0, f < minFeed {
+                minFeed = f
+            }
+        }
+        if !minFeed.isFinite {
+            minFeed = 1
+        }
+        if maxFeed <= 0 {
+            maxFeed = 1
+        }
         return (minFeed, maxFeed)
     }
 

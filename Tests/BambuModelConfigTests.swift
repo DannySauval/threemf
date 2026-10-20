@@ -1,6 +1,9 @@
 import Foundation
 import simd
 import Testing
+#if canImport(ThreeMFCore)
+    @testable import ThreeMFCore
+#endif
 
 /// Tests for parsing Bambu/Orca `model_settings.config` + `project_settings.config`.
 /// Fixtures are trimmed-but-faithful copies of the real Chiken(2).3mf layout: 4 plates,
@@ -156,6 +159,33 @@ struct BambuModelConfigTests {
         // None / malformed → 0 (base).
         #expect(BambuModelConfig.decodePaintColor("") == 0)
         #expect(BambuModelConfig.decodePaintColor("zz") == 0)
+        // Oversized paint_color strings (> 4096 hex chars) are rejected in O(1).
+        let huge = String(repeating: "F", count: 5000)
+        #expect(BambuModelConfig.decodePaintColor(huge) == 0)
+    }
+
+    @Test("model_settings.config with DOCTYPE/ENTITY declaration is rejected before XMLParser")
+    func rejectsEntityDeclarations() throws {
+        let entityBomb = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE config [
+          <!ENTITY lol "lol">
+        ]>
+        <config>
+          <object id="6"><metadata key="extruder" value="2"/></object>
+        </config>
+        """
+        let c = BambuModelConfig.parse(
+            modelSettings: entityBomb.data(using: .utf8),
+            projectSettings: Self.projectSettings.data(using: .utf8)
+        )
+        #expect(c.plates.isEmpty)
+        #expect(!c.hasColorAssignment)
+
+        // Also catches UTF-16 encoded DOCTYPE/ENTITY declarations (interleaved zero bytes).
+        let utf16Bomb = entityBomb.data(using: .utf16)
+        #expect(utf16Bomb != nil)
+        #expect(try ThreeMFMeshParser.containsDTDOrEntityDeclaration(#require(utf16Bomb)))
     }
 
     @Test("Missing / malformed inputs yield an empty config, never a throw")

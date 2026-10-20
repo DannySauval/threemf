@@ -2,6 +2,9 @@ import Foundation
 import simd
 import Testing
 import ZIPFoundation
+#if canImport(ThreeMFCore)
+    @testable import ThreeMFCore
+#endif
 
 /// Integration test: a synthesized multi-plate Bambu-style 3MF should come out of
 /// `ThreeMFMeshParser.parseMesh` with per-object colors (from the filament palette) and

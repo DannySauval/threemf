@@ -10,7 +10,7 @@
   <a href="https://github.com/guanchzhou/threemf/actions/workflows/codeql.yml"><img src="https://img.shields.io/github/actions/workflow/status/guanchzhou/threemf/codeql.yml?style=flat-square&label=CodeQL" alt="CodeQL"></a>
   <a href="https://github.com/guanchzhou/threemf/blob/main/LICENSE"><img src="https://img.shields.io/github/license/guanchzhou/threemf?style=flat-square" alt="License"></a>
   <img src="https://img.shields.io/badge/platform-macOS%2014+-black?style=flat-square&logo=apple" alt="Platform">
-  <img src="https://img.shields.io/badge/arch-Apple%20Silicon-black?style=flat-square&logo=apple" alt="Apple Silicon">
+  <img src="https://img.shields.io/badge/arch-universal-black?style=flat-square&logo=apple" alt="Universal">
   <a href="https://github.com/guanchzhou/threemf/releases/latest"><img src="https://img.shields.io/github/downloads/guanchzhou/threemf/total?style=flat-square&color=green" alt="Downloads"></a>
   <img src="https://img.shields.io/badge/SLSA-Level%202-brightgreen?style=flat-square" alt="SLSA L2">
 </p>
@@ -67,8 +67,11 @@ swift build -c release
 ### Usage
 
 ```
-threemf-cli info <file>                            # prints JSON: format, counts, bounding box, materials
-threemf-cli thumbnail <input> <output.png> [--size N]  # renders 3D thumbnail (default 512×512)
+threemf-cli info <file>                                                # prints JSON: format, counts, bounding box, materials
+threemf-cli validate <file>                                            # parses file and prints PASS/FAIL
+threemf-cli thumbnail <input> <output.png> [--size N] [--plate N] [--cache] # renders 3D/toolpath thumbnail (default 512×512)
+threemf-cli batch info <files...>                                      # parallel JSONL info across files
+threemf-cli batch validate <files...>                                  # parallel PASS/FAIL validation across files
 ```
 
 ## Requirements

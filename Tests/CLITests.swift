@@ -90,4 +90,65 @@ final class CLITests: XCTestCase {
         // Sorted keys: "error" before "file"
         XCTAssertTrue(line.hasPrefix(#"{"error":"#), line)
     }
+
+    // MARK: - resolvePlate / batch / gcode thumbnail
+
+    func testResolvePlate_validAndInvalid() throws {
+        XCTAssertNil(try CLI.resolvePlate(from: ["thumbnail", "in.3mf", "out.png"]))
+        XCTAssertEqual(try CLI.resolvePlate(from: ["thumbnail", "in.3mf", "out.png", "--plate", "2"]), 2)
+        XCTAssertThrowsError(try CLI.resolvePlate(from: ["thumbnail", "in.3mf", "out.png", "--plate"])) { error in
+            XCTAssertTrue((error as? CLIError)?.isUsageError ?? false)
+        }
+        XCTAssertThrowsError(try CLI.resolvePlate(from: ["thumbnail", "in.3mf", "out.png", "--plate", "0"])) { error in
+            XCTAssertTrue((error as? CLIError)?.isUsageError ?? false)
+        }
+        XCTAssertThrowsError(try CLI.resolvePlate(from: [
+            "thumbnail",
+            "in.3mf",
+            "out.png",
+            "--plate",
+            "abc"
+        ])) { error in
+            XCTAssertTrue((error as? CLIError)?.isUsageError ?? false)
+        }
+    }
+
+    func testBatch_unknownAction_throwsUsageError() async {
+        do {
+            try await CLI.batch(action: "bogus", files: [])
+            XCTFail("Expected invalidBatchAction error")
+        } catch let error as CLIError {
+            XCTAssertTrue(error.isUsageError)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
+    func testBatchInfo_missingFile_throwsValidationFailed() async {
+        let missing = URL(fileURLWithPath: "/nonexistent/\(UUID().uuidString).stl")
+        do {
+            try await CLI.batch(action: "info", files: [missing])
+            XCTFail("Expected batchValidationFailed when a file in batch info fails")
+        } catch CLIError.batchValidationFailed {
+            // Expected
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
+    func testThumbnail_gcode_rendersPNG() throws {
+        let gcodeURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cli-\(UUID().uuidString)").appendingPathExtension("gcode")
+        let outURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cli-\(UUID().uuidString)").appendingPathExtension("png")
+        defer {
+            try? FileManager.default.removeItem(at: gcodeURL)
+            try? FileManager.default.removeItem(at: outURL)
+        }
+        try Data("G0 X0 Y0 Z0.2 F600\nG1 X10 Y10 E1\n".utf8).write(to: gcodeURL)
+
+        try CLI.thumbnail(input: gcodeURL, output: outURL, size: 64)
+        let pngData = try Data(contentsOf: outURL)
+        XCTAssertNoThrow(try SafePNGValidator.validatePNGData(pngData))
+    }
 }

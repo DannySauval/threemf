@@ -21,6 +21,7 @@ public enum SceneBuilder {
 
         // Model node
         let modelNode = SCNNode(geometry: geometry)
+        modelNode.name = "model"
 
         // 3D printing models use Z-up, SceneKit uses Y-up — rotate -90° around X
         modelNode.eulerAngles.x = -.pi / 2
@@ -48,7 +49,9 @@ public enum SceneBuilder {
         // Camera — front-right, slightly above (classic 3/4 view). The distance is fitted
         // to the model's silhouette so it fills ~90% of the frame, rather than a fixed
         // position that over-margins non-cubic models (e.g. tall/flat parts).
-        let halfExtents = simd_float3(Float(size.x), Float(size.y), Float(size.z)) * (0.5 * normalizeScale)
+        // `modelNode.boundingBox` is in local (Z-up) space; after the -90° X rotation,
+        // local Z maps to world Y and local Y maps to world Z.
+        let halfExtents = simd_float3(Float(size.x), Float(size.z), Float(size.y)) * (0.5 * normalizeScale)
         let cameraNode = SCNNode()
         cameraNode.name = "camera"
         cameraNode.camera = SCNCamera()
@@ -280,8 +283,13 @@ public enum SceneBuilder {
     }
 
     /// Builds a wireframe grid plane representing the print bed.
-    /// `extent` is half-width per side; `divisions` controls density.
-    public static func makeBedGridNode(extent: Float = 1.2, divisions: Int = 12) -> SCNNode {
+    /// `extent` is half-width per side; `divisions` controls density; `yOffset` places the
+    /// plane at the model's world-space base (defaults to `-1`).
+    public static func makeBedGridNode(
+        extent: Float = 1.2,
+        divisions: Int = 12,
+        yOffset: Float = -1
+    ) -> SCNNode {
         let root = SCNNode()
         root.name = "bedGrid"
         let step = (extent * 2) / Float(divisions)
@@ -319,8 +327,8 @@ public enum SceneBuilder {
         mat.lightingModel = .constant
         geometry.firstMaterial = mat
         let node = SCNNode(geometry: geometry)
-        // Place the grid just below the model's bottom (model is normalized to ±1).
-        node.position = SCNVector3(0, -1, 0)
+        // Place the grid right at the model's bottom in SceneKit world Y.
+        node.position = SCNVector3(0, CGFloat(yOffset), 0)
         root.addChildNode(node)
         return root
     }

@@ -5,7 +5,7 @@ import SceneKit
 
 /// Returns a textual summary of a .3mf, .stl, or .gcode file. Surface for Siri / Shortcuts.
 struct ShowThreeMFInfo: AppIntent {
-    nonisolated(unsafe) static var title: LocalizedStringResource = "Show 3MF/STL Info"
+    nonisolated(unsafe) static var title: LocalizedStringResource = "Show 3MF/STL/G-code Info"
     nonisolated(unsafe) static var description = IntentDescription(
         "Returns triangle count, vertex count, bounding box, and metadata for a .3mf, .stl, or .gcode file."
     )
@@ -63,7 +63,7 @@ struct ShowThreeMFInfo: AppIntent {
 
 /// Renders a PNG thumbnail of a .3mf, .stl, or .gcode file at a specified size. Surface for Shortcuts.
 struct RenderThreeMFThumbnail: AppIntent {
-    nonisolated(unsafe) static var title: LocalizedStringResource = "Render 3MF/STL Thumbnail"
+    nonisolated(unsafe) static var title: LocalizedStringResource = "Render 3MF/STL/G-code Thumbnail"
     nonisolated(unsafe) static var description = IntentDescription(
         "Renders a PNG thumbnail of a .3mf, .stl, or .gcode file at the requested size."
     )
@@ -119,14 +119,22 @@ struct RenderThreeMFThumbnail: AppIntent {
         guard
             let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil),
             let buffer = CFDataCreateMutable(nil, 0)
-            .map({ NSMutableData(data: $0 as Data) }) ?? NSMutableData() as Optional,
+                .map({ NSMutableData(data: $0 as Data) }) ?? NSMutableData() as Optional,
             let dest = CGImageDestinationCreateWithData(buffer, "public.png" as CFString, 1, nil)
         else {
-            throw NSError(domain: "ShowThreeMFInfo", code: 1)
+            throw NSError(
+                domain: "RenderThreeMFThumbnail",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Failed to prepare PNG destination"]
+            )
         }
         CGImageDestinationAddImage(dest, cg, nil)
         guard CGImageDestinationFinalize(dest) else {
-            throw NSError(domain: "ShowThreeMFInfo", code: 2)
+            throw NSError(
+                domain: "RenderThreeMFThumbnail",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Failed to encode thumbnail PNG"]
+            )
         }
         return .result(value: IntentFile(
             data: buffer as Data,

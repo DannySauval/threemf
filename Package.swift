@@ -25,7 +25,8 @@ let package = Package(
         .testTarget(
             name: "ThreeMFCoreTests",
             dependencies: ["ThreeMFCore"],
-            path: "Tests"
+            path: "Tests",
+            exclude: ["CLITests.swift"]
         ),
     ]
 )

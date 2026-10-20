@@ -2,6 +2,9 @@ import SceneKit
 import simd
 import XCTest
 import ZIPFoundation
+#if canImport(ThreeMFCore)
+    @testable import ThreeMFCore
+#endif
 
 class ThreeMFMeshParserTests: XCTestCase {
     // MARK: - 3MF Parsing
@@ -224,7 +227,7 @@ class ThreeMFMeshParserTests: XCTestCase {
             .appendingPathExtension("3mf")
         // Create a ZIP with no 3D/3dmodel.model
         let archive = try Archive(url: url, accessMode: .create, pathEncoding: nil)
-        let dummyData = "hello".data(using: .utf8)!
+        let dummyData = try XCTUnwrap("hello".data(using: .utf8))
         // S8 fix: surface real fixture-setup errors instead of silently swallowing.
         try archive.addEntry(
             with: "dummy.txt",
@@ -864,5 +867,76 @@ class ThreeMFMeshParserTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: url) }
 
         XCTAssertEqual(ThreeMFExtractor.listPlates(from: url), [])
+    }
+
+    func testParse3MF_multiLevelComponentAndSharedExternalModelFile_resolvesAllObjects() throws {
+        // Root build item (id=10) -> inline intermediate object (id=20) -> two components (id=1, id=2)
+        // both stored inside the same external 3D/Objects/shared.model file.
+        let rootXML = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <model xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02"
+               xmlns:p="http://schemas.microsoft.com/3dmanufacturing/production/2015/06">
+          <resources>
+            <object id="20" type="model">
+              <components>
+                <component p:path="/3D/Objects/shared.model" objectid="1" />
+                <component p:path="/3D/Objects/shared.model" objectid="2" />
+              </components>
+            </object>
+            <object id="10" type="model">
+              <components>
+                <component objectid="20" />
+              </components>
+            </object>
+          </resources>
+          <build>
+            <item objectid="10" />
+          </build>
+        </model>
+        """
+        let sharedXML = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <model xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">
+          <resources>
+            <object id="1" type="model">
+              <mesh>
+                <vertices>
+                  <vertex x="0" y="0" z="0" />
+                  <vertex x="1" y="0" z="0" />
+                  <vertex x="0" y="1" z="0" />
+                </vertices>
+                <triangles>
+                  <triangle v1="0" v2="1" v3="2" />
+                </triangles>
+              </mesh>
+            </object>
+            <object id="2" type="model">
+              <mesh>
+                <vertices>
+                  <vertex x="0" y="0" z="5" />
+                  <vertex x="2" y="0" z="5" />
+                  <vertex x="0" y="2" z="5" />
+                </vertices>
+                <triangles>
+                  <triangle v1="0" v2="1" v3="2" />
+                </triangles>
+              </mesh>
+            </object>
+          </resources>
+          <build/>
+        </model>
+        """
+        let url = try make3MFFile(entries: [
+            (path: "3D/3dmodel.model", content: XCTUnwrap(rootXML.data(using: .utf8))),
+            (path: "3D/Objects/shared.model", content: XCTUnwrap(sharedXML.data(using: .utf8))),
+        ])
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let mesh = try ThreeMFMeshParser.parseMesh(from: url)
+        XCTAssertEqual(mesh.vertices.count, 6)
+        XCTAssertEqual(mesh.indices.count, 6)
+        // Object 1 has max X=1, Z=0; Object 2 has max X=2, Z=5. Both must be present.
+        XCTAssertEqual(mesh.boundingBox.max.x, 2, accuracy: 0.001)
+        XCTAssertEqual(mesh.boundingBox.max.z, 5, accuracy: 0.001)
     }
 }

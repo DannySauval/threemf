@@ -1,6 +1,9 @@
 import Foundation
 import Testing
 import ZIPFoundation
+#if canImport(ThreeMFCore)
+    @testable import ThreeMFCore
+#endif
 
 /// Smoke-fuzzing harness using swift-testing's `@Test` macros (XCTest version migrated).
 /// Feeds randomized byte sequences to STLParser and ThreeMFMeshParser to assert they
