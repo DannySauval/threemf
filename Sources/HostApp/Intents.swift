@@ -116,10 +116,9 @@ struct RenderThreeMFThumbnail: AppIntent {
         let pixelSize = CGSize(width: size, height: size)
         let image = renderer.snapshot(atTime: 0, with: pixelSize, antialiasingMode: .multisampling2X)
 
+        let buffer = NSMutableData()
         guard
             let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil),
-            let buffer = CFDataCreateMutable(nil, 0)
-                .map({ NSMutableData(data: $0 as Data) }) ?? NSMutableData() as Optional,
             let dest = CGImageDestinationCreateWithData(buffer, "public.png" as CFString, 1, nil)
         else {
             throw NSError(

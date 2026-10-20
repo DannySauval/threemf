@@ -346,8 +346,8 @@ public enum ThreeMFMeshParser {
         // Per-triangle plate index, populated only for multi-plate Bambu/Orca files.
         var allTrianglePlates: [Int] = []
 
-        // Aggregate caps to bound memory.
         func canAppend(verts: Int, tris: Int) -> Bool {
+            // Aggregate caps to bound memory.
             allVertices.count + verts <= limits.maxVertices
                 && (allIndices.count / 3) + tris <= limits.maxTriangles
         }
