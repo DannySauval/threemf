@@ -4,6 +4,20 @@ All notable changes to threemf are documented here. Format: Keep a Changelog. Ve
 
 ## [Unreleased]
 
+## [1.6.1] - 2026-10-20
+
+### Security
+- **XML entity guard on `model_settings.config` and UTF-16 `DOCTYPE`/`ENTITY` payloads**: `BambuModelConfig.parseModelSettings` now refuses `DOCTYPE`/`ENTITY` declarations and disables external entities before invoking `XMLParser`, and `ThreeMFMeshParser.containsDTDOrEntityDeclaration` scans raw bytes ignoring interleaved `0x00` bytes so UTF-16/UTF-32 XML payloads cannot bypass the check.
+- **Bounded `paint_color` decoding**: `BambuModelConfig.decodePaintColor` caps input length at 4,096 hex chars and decodes nibbles directly from UTF-8 bytes without allocating an intermediate `[Bool]` bit array per triangle.
+
+### Fixed
+- **3MF nested component reachability and shared external `.model` files**: `ThreeMFMeshParser` computes `neededObjectIds` transitively across multi-level `<component>` hierarchies and imports all `<object>` meshes discovered in an external `.model` file by their object IDs so sibling components referencing the same archive entry do not re-extract or collide on dictionary iteration order.
+- **G-code `G92` resets, parenthesized comments, and travel/Z-hop layer tracking**: `GCodeParser` handles `G92` coordinate/extruder resets (such as `G92 E0` in `M82` mode), skips inline `( ... )` comments during parameter parsing, and avoids collapsing or inflating `layerCount` across pre-print nozzle lifts and travel Z-hops.
+- **World-space camera framing, presets, and G-code top-down thumbnails**: `SceneBuilder` and `ToolpathSceneBuilder` map local Z-up bounds to SceneKit Y-up world half-extents before fitting the camera; Quick Look camera presets (`1`–`6`) frame to the active model's normalized half-extents and reset `fieldOfView`; and `ToolpathSceneBuilder.buildTopDownScene` fits the camera to the toolpath silhouette.
+- **Quick Look `< 2 MB` Bambu plate HUD, wireframe isolation, axis gizmo orientation, and bed grid placement**: `< 2 MB` 3MFs that auto-load into 3D now populate `BambuPlateInfo` in the HUD; wireframe toggle (`w`) only affects the triangle mesh node; the axis gizmo (`a`) rotates live with world orientation as the camera orbits; the bed grid (`g`) sits at the model's base; and dismissing the help overlay (`?`) removes its outside-click gesture recognizer.
+- **CLI `.gcode` thumbnails, `--cache` key scoping, `--plate` validation, `batch` error handling, and usage exit codes**: `threemf-cli thumbnail` renders `.gcode` files, scopes `--cache` entries by `--size` and `--plate`, validates `--plate` values, exits non-zero when `batch info` encounters a failing file or unknown action, and returns exit code `2` on usage errors.
+- **SwiftPM test suite (`swift test`)**: `ThreeMFCoreTests` builds and passes via `swift test`, and `test.yml` runs both Xcode and SwiftPM test suites.
+
 ## [1.6.0] - 2026-09-29
 
 ### Fixed
