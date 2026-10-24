@@ -4,6 +4,9 @@ on:
   push:
     tags: ["v*"]
 
+permissions:
+  contents: read
+
 jobs:
   # Job 1: Build and test (no secrets, no signing)
   build:
@@ -11,7 +14,9 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install XcodeGen
         run: brew install xcodegen
@@ -41,7 +46,7 @@ jobs:
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
       - name: Upload unsigned artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: threemf-unsigned
           path: threemf-unsigned.zip
@@ -54,8 +59,9 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           sparse-checkout: |
             Sources/HostApp/HostApp.entitlements
             Sources/PreviewExtension/PreviewExtension.entitlements
@@ -65,7 +71,7 @@ jobs:
             CHANGELOG.md
 
       - name: Download unsigned artifact
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: threemf-unsigned
 
@@ -154,7 +160,7 @@ jobs:
         run: ditto -c -k --keepParent threemf.app threemf.zip
 
       - name: Upload signed artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: threemf-signed
           path: threemf.zip
@@ -228,7 +234,7 @@ jobs:
           CASK
 
           git config user.email "maltsev.andrey@gmail.com"
-          git config user.name "Andrei Maltsev"
+          git config user.name "Andrey Maltsev"
           git add -A
           git commit -m "Update threemf to v${VERSION}"
           git push
@@ -247,11 +253,11 @@ jobs:
       contents: read
     steps:
       - name: Download signed artifact
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: threemf-signed
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: threemf.zip
