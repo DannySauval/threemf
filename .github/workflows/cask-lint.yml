@@ -29,7 +29,7 @@ jobs:
           awk '/cat > Casks\/threemf.rb << CASK$/{flag=1;next} /^ *CASK$/{flag=0} flag' \
             .github/workflows/release.yml \
             | sed 's/^          //' \
-            | sed -e 's/${VERSION}/1.0.0/' -e "s/\${SHA256}/$(printf '%064d' 0)/" \
+            | sed -e "s/\${VERSION}/1.0.0/" -e "s/\${SHA256}/$(printf '%064d' 0)/" \
             > cask-lint/Casks/threemf.rb
           test -s cask-lint/Casks/threemf.rb
           cat cask-lint/Casks/threemf.rb

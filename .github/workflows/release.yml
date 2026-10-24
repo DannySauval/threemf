@@ -241,7 +241,7 @@ jobs:
 
       - name: Cleanup keychain
         if: always()
-        run: security delete-keychain $RUNNER_TEMP/signing.keychain-db 2>/dev/null || true
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
 
   # Job 3: SLSA provenance (isolated, non-forgeable)
   provenance:
