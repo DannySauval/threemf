@@ -219,6 +219,11 @@ jobs:
             desc "Quick Look plugin for previewing .3mf, .stl, and .gcode 3D printing files"
             homepage "https://github.com/guanchzhou/threemf"
 
+            livecheck do
+              url :url
+              strategy :github_latest
+            end
+
             depends_on macos: :sonoma
 
             app "threemf.app"
@@ -232,6 +237,11 @@ jobs:
             end
 
             zap trash: [
+              "~/Library/Application Scripts/com.andreymaltsev.3mf-quicklook",
+              "~/Library/Application Scripts/com.andreymaltsev.3mf-quicklook.findersync",
+              "~/Library/Application Scripts/com.andreymaltsev.3mf-quicklook.mdimporter",
+              "~/Library/Application Scripts/com.andreymaltsev.3mf-quicklook.preview",
+              "~/Library/Application Scripts/com.andreymaltsev.3mf-quicklook.thumbnail",
               "~/Library/Containers/com.andreymaltsev.3mf-quicklook",
               "~/Library/Containers/com.andreymaltsev.3mf-quicklook.findersync",
               "~/Library/Containers/com.andreymaltsev.3mf-quicklook.mdimporter",
@@ -243,8 +253,8 @@ jobs:
 
           git config user.email "maltsev.andrey@gmail.com"
           git config user.name "Andrey Maltsev"
-          git add -A
-          git commit -m "Update threemf to v${VERSION}"
+          git add Casks/threemf.rb
+          git diff --cached --quiet || git commit -m "Update threemf to v${VERSION}"
           git push
 
       - name: Cleanup keychain
