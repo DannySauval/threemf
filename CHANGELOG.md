@@ -14,6 +14,7 @@ All notable changes to threemf are documented here. Format: Keep a Changelog. Ve
 - **Release workflow hardening**: the signing certificate file is deleted in the cleanup step, the signed app is checked with `codesign --verify --deep --strict` before zipping, and every release job has a timeout.
 
 ### Fixed
+- **Quick Look for Bambu-typed `.3mf` files**: the preview, thumbnail, and Spotlight importer also accept `com.bambulab.3mf`, the type Bambu Studio registers for `.3mf`. Double-click still opens the slicer.
 - **Corrupt first thumbnail no longer hides later ones**: `ThreeMFExtractor.extractThumbnail` tries the next candidate when one is corrupt, oversized, or not a PNG, and throws only after every candidate failed.
 - **Root model from `_rels/.rels`**: `ThreeMFMeshParser` follows the package's 3D-model relationship target (size-capped, DTD/entity declarations refused) and falls back to the conventional `3D/3dmodel.model` paths.
 - **Spotlight 3MF indexing reads less**: the large-file metadata path decompresses at most 1 MB of the root model and stops at `<resources>`, and the full Spotlight path skips normal computation.

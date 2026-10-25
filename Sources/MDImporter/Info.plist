@@ -42,6 +42,7 @@
 	<key>LSItemContentTypes</key>
 	<array>
 		<string>com.andreymaltsev.threemf</string>
+		<string>com.bambulab.3mf</string>
 		<string>com.andreymaltsev.gcode</string>
 		<string>public.standard-tesselated-geometry-format</string>
 	</array>
