@@ -34,7 +34,7 @@ enum SpotlightMetadataExtractor {
             case "stl":
                 mesh = try STLParser.parseMesh(from: fileURL, limits: .spotlight)
             case "3mf":
-                mesh = try ThreeMFMeshParser.parseMesh(from: fileURL, limits: .spotlight)
+                mesh = try ThreeMFMeshParser.parseMesh(from: fileURL, limits: .spotlight, computesNormals: false)
             default:
                 return false
             }

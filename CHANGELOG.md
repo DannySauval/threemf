@@ -4,6 +4,22 @@ All notable changes to threemf are documented here. Format: Keep a Changelog. Ve
 
 ## [Unreleased]
 
+## [1.6.2] - 2026-10-25
+
+### Security
+- **One central-directory walk per archive**: ZIPFoundation's `archive[path]` rescans the whole central directory on every lookup, so a crafted `.3mf` with tens of thousands of entries and components turned each thumbnail or component lookup into a full walk. Each opened archive now builds one path index (capped at 50,000 entries) and every lookup goes through it. `<component>` and build `<item>` elements are capped at 10,000 per model file, each component path is extracted at most once, and nested component expansion stops at 100,000 mesh instances.
+- **Embedded thumbnails must be PNG**: `SafePNGValidator` requires the PNG signature, ImageIO type `public.png`, and exactly one image, so a TIFF, JPEG, GIF, or animated image named `.png` never reaches its decoder.
+- **Downsampled thumbnail decode**: Finder thumbnails decode embedded and cached PNGs through `CGImageSourceCreateThumbnailAtIndex` at the requested size × scale instead of decoding up to 16 MP at full resolution.
+- **Thumbnail fallback renders stop on a deadline**: the thumbnail extension's STL, G-code, and 3MF fallback parses give up after 5 seconds through `ParseCancellation(timeout:)`.
+- **Release workflow hardening**: the signing certificate file is deleted in the cleanup step, the signed app is checked with `codesign --verify --deep --strict` before zipping, and every release job has a timeout.
+
+### Fixed
+- **Corrupt first thumbnail no longer hides later ones**: `ThreeMFExtractor.extractThumbnail` tries the next candidate when one is corrupt, oversized, or not a PNG, and throws only after every candidate failed.
+- **Root model from `_rels/.rels`**: `ThreeMFMeshParser` follows the package's 3D-model relationship target (size-capped, DTD/entity declarations refused) and falls back to the conventional `3D/3dmodel.model` paths.
+- **Spotlight 3MF indexing reads less**: the large-file metadata path decompresses at most 1 MB of the root model and stops at `<resources>`, and the full Spotlight path skips normal computation.
+- **Quick Look 3MF previews keep ZIP work off the main thread**: plate listing, PNG extraction and decode, plate cycling, and Bambu plate JSON reads run on a background queue with stale-result checks, and each preview opens the archive once.
+- **Homebrew zap removes the host app container**: `~/Library/Containers/com.andreymaltsev.3mf-quicklook` is included in the cask's `zap` list.
+
 ## [1.6.1] - 2026-10-20
 
 ### Security

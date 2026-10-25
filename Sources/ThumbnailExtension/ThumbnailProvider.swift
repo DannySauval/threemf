@@ -13,6 +13,8 @@ class ThumbnailProvider: QLThumbnailProvider {
     /// and a huge file is a strong proxy without us having to open the archive.
     private static let huge3MFNoEmbedThresholdBytes: Int64 = 100 * 1024 * 1024 // 100 MB
     private static let hugeSTLThresholdBytes: Int64 = 50 * 1024 * 1024 // 50 MB
+    /// Finder never cancels a thumbnail request, so fallback parses stop on a deadline instead.
+    private static let parseTimeout: TimeInterval = 5
 
     override func provideThumbnail(
         for request: QLFileThumbnailRequest,
@@ -23,7 +25,7 @@ class ThumbnailProvider: QLThumbnailProvider {
         // Cache check — both .3mf and .stl write a PNG to the cache after rendering,
         // so a hit here saves the entire parse+render path on the second preview.
         if let cached = ThumbnailCache.cachedThumbnail(for: request.fileURL),
-           let image = SafePNGValidator.nsImage(fromPNG: cached)
+           let image = decodedThumbnail(cached, request: request)
         {
             renderImageThumbnail(image: image, request: request, handler: handler)
             return
@@ -59,6 +61,7 @@ class ThumbnailProvider: QLThumbnailProvider {
             let toolpath = try GCodeParser.parse(
                 from: request.fileURL,
                 limits: .quickLook,
+                cancellation: ParseCancellation(timeout: Self.parseTimeout),
                 outputSegmentBudget: GCodeParser.thumbnailSegmentBudget,
                 computesStatistics: false
             )
@@ -93,7 +96,7 @@ class ThumbnailProvider: QLThumbnailProvider {
     ) {
         // Try embedded PNG first (fast).
         if let imageData = try? ThreeMFExtractor.extractThumbnail(from: request.fileURL),
-           let image = SafePNGValidator.nsImage(fromPNG: imageData)
+           let image = decodedThumbnail(imageData, request: request)
         {
             // Cache the raw PNG so subsequent previews skip the ZIP walk.
             ThumbnailCache.store(imageData, for: request.fileURL)
@@ -111,7 +114,11 @@ class ThumbnailProvider: QLThumbnailProvider {
         }
 
         do {
-            let mesh = try ThreeMFMeshParser.parseMesh(from: request.fileURL, limits: .quickLook)
+            let mesh = try ThreeMFMeshParser.parseMesh(
+                from: request.fileURL,
+                limits: .quickLook,
+                cancellation: ParseCancellation(timeout: Self.parseTimeout)
+            )
             renderSceneThumbnail(mesh: mesh, request: request, handler: handler)
         } catch {
             log.error("3MF thumbnail mesh parse failed: \(error.localizedDescription, privacy: .public)")
@@ -131,7 +138,11 @@ class ThumbnailProvider: QLThumbnailProvider {
         }
 
         do {
-            let mesh = try STLParser.parseMesh(from: request.fileURL, limits: .quickLook)
+            let mesh = try STLParser.parseMesh(
+                from: request.fileURL,
+                limits: .quickLook,
+                cancellation: ParseCancellation(timeout: Self.parseTimeout)
+            )
             renderSceneThumbnail(mesh: mesh, request: request, handler: handler)
         } catch {
             log.error("STL thumbnail parse failed: \(error.localizedDescription, privacy: .public)")
@@ -139,18 +150,27 @@ class ThumbnailProvider: QLThumbnailProvider {
         }
     }
 
+    /// Decodes at most the requested size in pixels so an embedded PNG near the 16 MP cap
+    /// is never fully decoded for a Finder icon.
+    private func decodedThumbnail(_ data: Data, request: QLFileThumbnailRequest) -> CGImage? {
+        let maxSize = request.maximumSize
+        let maxPixelSize = Int((max(maxSize.width, maxSize.height) * max(request.scale, 1)).rounded(.up))
+        return SafePNGValidator.cgImage(fromPNG: data, maxPixelSize: maxPixelSize)
+    }
+
     private func renderImageThumbnail(
-        image: NSImage,
+        image: CGImage,
         request: QLFileThumbnailRequest,
         handler: @escaping (QLThumbnailReply?, Error?) -> Void
     ) {
         let maxSize = request.maximumSize
-        let imageSize = image.size
+        let imageSize = CGSize(width: image.width, height: image.height)
         let scale = min(maxSize.width / imageSize.width, maxSize.height / imageSize.height, 1.0)
         let thumbnailSize = CGSize(width: imageSize.width * scale, height: imageSize.height * scale)
 
-        let reply = QLThumbnailReply(contextSize: thumbnailSize) { () -> Bool in
-            image.draw(in: CGRect(origin: .zero, size: thumbnailSize))
+        let reply = QLThumbnailReply(contextSize: thumbnailSize) { (context: CGContext) -> Bool in
+            context.interpolationQuality = .high
+            context.draw(image, in: CGRect(origin: .zero, size: thumbnailSize))
             return true
         }
         handler(reply, nil)

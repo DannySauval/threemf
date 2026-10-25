@@ -22,11 +22,6 @@ public enum ThreeMFExtractor {
     /// Maximum allowed thumbnail size (10 MB) to prevent ZIP bomb attacks
     private static let maxThumbnailSize = 10 * 1024 * 1024
 
-    /// Cap on central-directory entries walked by name (no extraction). High enough that
-    /// part-heavy Bambu archives — which list `3D/Objects/*.model` before `Metadata/` —
-    /// still reach plate PNGs. Bounds pathological million-entry ZIPs.
-    private static let maxDirectoryEntries = 50000
-
     /// Cap on *candidate* thumbnail paths considered during the extractThumbnail fallback.
     /// Only paths under `metadata/` / `thumbnail/` with a `.png` suffix count; model entries
     /// do not. Bounds extraction attempts, not directory walks.
@@ -48,67 +43,71 @@ public enum ThreeMFExtractor {
     ]
 
     public static func extractThumbnail(from fileURL: URL) throws -> Data {
-        let archive: Archive
+        let archive: ThreeMFArchive
         do {
-            archive = try Archive(url: fileURL, accessMode: .read)
+            archive = try ThreeMFArchive(url: fileURL)
         } catch {
             throw ThreeMFExtractorError.cannotOpenArchive
         }
+        return try extractThumbnail(from: archive)
+    }
 
-        // Try known paths first (fast path)
+    /// Returns the first candidate that extracts and validates as a PNG. A corrupt or oversized
+    /// candidate does not end the search; the error is thrown only once every candidate failed.
+    static func extractThumbnail(from archive: ThreeMFArchive) throws -> Data {
+        var sawTooLarge = false
+        var tried = Set<String>()
+
+        func attempt(_ entry: Entry) -> Data? {
+            do {
+                return try validatedPNG(extractThumbnailEntry(entry, from: archive))
+            } catch ThreeMFExtractorError.thumbnailTooLarge {
+                sawTooLarge = true
+            } catch {}
+            return nil
+        }
+
         for path in knownThumbnailPaths {
-            if let entry = archive[path] {
-                guard entry.uncompressedSize <= UInt64(maxThumbnailSize) else {
-                    throw ThreeMFExtractorError.thumbnailTooLarge
-                }
-                var data = Data()
-                _ = try archive.extract(entry) { chunk in
-                    data.append(chunk)
-                    if data.count > maxThumbnailSize {
-                        throw ThreeMFExtractorError.thumbnailTooLarge
-                    }
-                }
-                if !data.isEmpty {
-                    return try validatedPNG(data)
-                }
+            guard let entry = archive.entry(path) else { continue }
+            tried.insert(path)
+            if let data = attempt(entry) {
+                return data
             }
         }
 
-        // Fallback: find any PNG in thumbnail-like directories.
-        // Walk up to maxDirectoryEntries names so Metadata/ is reachable after many
-        // 3D/Objects entries; only candidate PNG paths count toward maxFallbackCandidates.
-        // Extract at most one PNG.
-        var walked = 0
+        // Fallback: any PNG in thumbnail-like directories, in central-directory order.
         var candidates = 0
-        for entry in archive {
-            walked += 1
-            if walked > maxDirectoryEntries {
-                break
-            }
+        for entry in archive.entries {
             let path = entry.path.lowercased()
             guard path.hasSuffix(".png"),
-                  path.hasPrefix("metadata/") || path.hasPrefix("thumbnail/")
+                  path.hasPrefix("metadata/") || path.hasPrefix("thumbnail/"),
+                  !tried.contains(entry.path)
             else { continue }
             candidates += 1
             if candidates > maxFallbackCandidates {
                 break
             }
-            guard entry.uncompressedSize <= UInt64(maxThumbnailSize) else {
-                throw ThreeMFExtractorError.thumbnailTooLarge
-            }
-            var data = Data()
-            _ = try archive.extract(entry) { chunk in
-                data.append(chunk)
-                if data.count > maxThumbnailSize {
-                    throw ThreeMFExtractorError.thumbnailTooLarge
-                }
-            }
-            if !data.isEmpty {
-                return try validatedPNG(data)
+            tried.insert(entry.path)
+            if let data = attempt(entry) {
+                return data
             }
         }
 
-        throw ThreeMFExtractorError.noThumbnailFound
+        throw sawTooLarge ? ThreeMFExtractorError.thumbnailTooLarge : ThreeMFExtractorError.noThumbnailFound
+    }
+
+    private static func extractThumbnailEntry(_ entry: Entry, from archive: ThreeMFArchive) throws -> Data {
+        guard entry.uncompressedSize <= UInt64(maxThumbnailSize) else {
+            throw ThreeMFExtractorError.thumbnailTooLarge
+        }
+        var data = Data()
+        _ = try archive.archive.extract(entry) { chunk in
+            data.append(chunk)
+            if data.count > maxThumbnailSize {
+                throw ThreeMFExtractorError.thumbnailTooLarge
+            }
+        }
+        return data
     }
 
     private static func validatedPNG(_ data: Data) throws -> Data {
@@ -141,28 +140,19 @@ public enum ThreeMFExtractor {
     /// extraction cost for plates the user never views.
     /// Returns `[]` for archives without plate metadata (common for non-Bambu 3MFs).
     public static func listPlates(from fileURL: URL) -> [PlateThumbnail] {
-        let archive: Archive
-        do {
-            archive = try Archive(url: fileURL, accessMode: .read)
-        } catch {
-            return []
-        }
+        guard let archive = try? ThreeMFArchive(url: fileURL) else { return [] }
+        return listPlates(from: archive)
+    }
 
+    static func listPlates(from archive: ThreeMFArchive) -> [PlateThumbnail] {
         // One entry per real plate. Bambu emits several PNGs per plate
         // (`plate_<N>.png`, `plate_<N>_small.png`, `plate_no_light_<N>.png`, `top_<N>.png`);
         // only the canonical full-size render — basename exactly `plate_<N>.png` or, as a
         // fallback, `top_<N>.png` — counts as a plate. Anything with an extra suffix is a variant.
         // `kind` 0 = plate (preferred), 1 = top; we keep one path per plate index.
-        // Walk names only up to maxDirectoryEntries — do not charge model entries against a
-        // tiny cap, or part-heavy archives never reach Metadata/plate_N.png.
         var byIndex: [Int: (kind: Int, path: String)] = [:]
-        var walked = 0
 
-        for entry in archive {
-            walked += 1
-            if walked > maxDirectoryEntries {
-                break
-            }
+        for entry in archive.entries {
             let lower = entry.path.lowercased()
             guard lower.hasPrefix("metadata/"), lower.hasSuffix(".png") else { continue }
             let basename = String(lower.split(separator: "/").last ?? "")
@@ -191,22 +181,18 @@ public enum ThreeMFExtractor {
         if let cached = ThumbnailCache.cachedThumbnail(for: fileURL, extraKey: plate.path) {
             return cached
         }
+        return try extractPlate(plate, from: ThreeMFArchive(url: fileURL))
+    }
 
-        let archive = try Archive(url: fileURL, accessMode: .read)
-        guard let entry = archive[plate.path] else { return nil }
-        guard entry.uncompressedSize <= UInt64(maxThumbnailSize) else {
-            throw ThreeMFExtractorError.thumbnailTooLarge
+    static func extractPlate(_ plate: PlateThumbnail, from archive: ThreeMFArchive) throws -> Data? {
+        if let cached = ThumbnailCache.cachedThumbnail(for: archive.url, extraKey: plate.path) {
+            return cached
         }
-        var data = Data()
-        _ = try archive.extract(entry) { chunk in
-            data.append(chunk)
-            if data.count > maxThumbnailSize {
-                throw ThreeMFExtractorError.thumbnailTooLarge
-            }
-        }
+        guard let entry = archive.entry(plate.path) else { return nil }
+        let data = try extractThumbnailEntry(entry, from: archive)
         guard !data.isEmpty else { return nil }
         let safe = try validatedPNG(data)
-        ThumbnailCache.store(safe, for: fileURL, extraKey: plate.path)
+        ThumbnailCache.store(safe, for: archive.url, extraKey: plate.path)
         return safe
     }
 
@@ -214,29 +200,19 @@ public enum ThreeMFExtractor {
     /// Returns nil if the archive lacks the JSON for that plate or it can't be parsed.
     /// Bounded by `maxThumbnailSize` (the JSON is small in practice — a few KB).
     public static func extractPlateInfo(plateIndex: Int, from fileURL: URL) -> BambuPlateInfo? {
-        let archive: Archive
-        do {
-            archive = try Archive(url: fileURL, accessMode: .read)
-        } catch {
-            return nil
-        }
+        guard let archive = try? ThreeMFArchive(url: fileURL) else { return nil }
+        return extractPlateInfo(plateIndex: plateIndex, from: archive)
+    }
+
+    static func extractPlateInfo(plateIndex: Int, from archive: ThreeMFArchive) -> BambuPlateInfo? {
         let candidatePaths = [
             "Metadata/plate_\(plateIndex).json",
             "Metadata/plate_\(plateIndex)/plate_\(plateIndex).json",
         ]
         for path in candidatePaths {
-            guard let entry = archive[path], entry.uncompressedSize <= UInt64(maxThumbnailSize) else { continue }
-            var data = Data()
-            do {
-                _ = try archive.extract(entry) { chunk in
-                    data.append(chunk)
-                    if data.count > maxThumbnailSize {
-                        throw ThreeMFExtractorError.thumbnailTooLarge
-                    }
-                }
-            } catch {
-                continue
-            }
+            guard let entry = archive.entry(path),
+                  let data = try? extractThumbnailEntry(entry, from: archive)
+            else { continue }
             if let info = BambuPlateInfo.parse(data) {
                 return info
             }

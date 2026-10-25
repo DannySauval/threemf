@@ -12,15 +12,28 @@ public final class ParseCancellation: Sendable {
     public static let checkStride = 1 << 16
 
     private let flag = OSAllocatedUnfairLock(initialState: false)
+    private let deadlineUptimeNanoseconds: UInt64?
 
-    public init() {}
+    public init() {
+        deadlineUptimeNanoseconds = nil
+    }
+
+    /// A token that also reports cancelled once `timeout` seconds have elapsed, for callers
+    /// such as the thumbnail extension that have no dismissal event to cancel on.
+    public init(timeout: TimeInterval) {
+        let nanoseconds = UInt64(max(0, timeout) * 1_000_000_000)
+        deadlineUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds + nanoseconds
+    }
 
     public func cancel() {
         flag.withLock { $0 = true }
     }
 
     public var isCancelled: Bool {
-        flag.withLock { $0 }
+        if let deadlineUptimeNanoseconds, DispatchTime.now().uptimeNanoseconds >= deadlineUptimeNanoseconds {
+            return true
+        }
+        return flag.withLock { $0 }
     }
 
     public func check() throws {

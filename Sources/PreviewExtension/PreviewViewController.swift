@@ -6,6 +6,33 @@ import simd
 
 private let log = Logger(subsystem: "com.andreymaltsev.3mf-quicklook", category: "preview")
 
+/// Longest edge, in pixels, that embedded thumbnails are decoded to for the preview window.
+private let previewImageMaxPixelSize = 4096
+
+/// The one `ThreeMFArchive` opened for a previewed file. `ThreeMFArchive` is not thread-safe,
+/// so the archive is opened and used only on `queue`.
+private final class PreviewArchiveSession: @unchecked Sendable {
+    private let url: URL
+    private let queue = DispatchQueue(label: "com.andreymaltsev.3mf-quicklook.preview.archive", qos: .userInitiated)
+    private var archive: ThreeMFArchive?
+    private var didOpen = false
+
+    init(url: URL) {
+        self.url = url
+    }
+
+    /// Runs `body` on the session queue with the archive, or nil when it cannot be opened.
+    func async(_ body: @escaping @Sendable (ThreeMFArchive?) -> Void) {
+        queue.async {
+            if !self.didOpen {
+                self.didOpen = true
+                self.archive = try? ThreeMFArchive(url: self.url)
+            }
+            body(self.archive)
+        }
+    }
+}
+
 enum PreviewError: Error, LocalizedError {
     case unsupportedFormat
     case meshLoadFailed(underlying: Error)
@@ -29,8 +56,14 @@ class PreviewViewController: NSViewController, @preconcurrency QLPreviewingContr
     /// and load the 3D scene directly. Small 3MFs parse in well under a second.
     private static let autoLoad3DSizeThreshold: Int64 = 2 * 1024 * 1024 // 2 MB
 
-    private var fileURL: URL?
     private var fileSizeBytes: Int64 = 0
+    /// Set for `.3mf` previews only.
+    private var archiveSession: PreviewArchiveSession?
+    /// Bambu/Orca plate JSON by plate number, fetched lazily on `archiveSession`.
+    private var plateInfoByNumber: [Int: BambuPlateInfo] = [:]
+    private var plateInfoRequested: Set<Int> = []
+    /// Stats currently shown in the HUD, so late plate JSON can be merged without re-walking the mesh.
+    private var hudStats: HUDStats?
     private var loadedMesh: MeshData?
     private var loadedToolpath: ToolpathData?
     private weak var scnView: ZoomSCNView?
@@ -142,9 +175,14 @@ class PreviewViewController: NSViewController, @preconcurrency QLPreviewingContr
         let load = beginPreviewLoad()
         let loadGeneration = load.generation
         let cancellation = load.cancellation
-        fileURL = url
         fileSizeBytes = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize.map(Int64.init) ?? 0
         let ext = url.pathExtension.lowercased()
+        archiveSession = nil
+        plates = []
+        currentPlateIndex = 0
+        plateInfoByNumber = [:]
+        plateInfoRequested = []
+        hudStats = nil
         log.debug("preparePreviewOfFile ext=\(ext, privacy: .public) size=\(self.fileSizeBytes)")
 
         // QuickLook gives us a non-Sendable completion handler. We always invoke it
@@ -154,7 +192,9 @@ class PreviewViewController: NSViewController, @preconcurrency QLPreviewingContr
 
         switch ext {
         case "3mf":
-            prepare3MFPreview(url: url, load: load, handler: handler)
+            let session = PreviewArchiveSession(url: url)
+            archiveSession = session
+            prepare3MFPreview(session: session, load: load, handler: handler)
         case "stl":
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
@@ -350,98 +390,95 @@ class PreviewViewController: NSViewController, @preconcurrency QLPreviewingContr
     }
 
     private func prepare3MFPreview(
-        url: URL,
+        session: PreviewArchiveSession,
         load: PreviewLoad,
         handler: @escaping (Error?) -> Void
     ) {
         // Same Sendable opt-out as preparePreviewOfFile — handler is always called from main.
         nonisolated(unsafe) let h = handler
         let loadGeneration = load.generation
-        let cancellation = load.cancellation
 
         // For small 3MFs, parsing the full mesh is fast enough that the embedded-thumbnail
         // detour is unnecessary friction. Load 3D directly.
         if fileSizeBytes > 0, fileSizeBytes < Self.autoLoad3DSizeThreshold {
-            DispatchQueue.global(qos: .userInitiated).async {
-                do {
-                    let mesh = try ThreeMFMeshParser.parseMesh(
-                        from: url,
-                        limits: .quickLook,
-                        cancellation: cancellation
-                    )
-                    DispatchQueue.main.async {
-                        if self.isPreviewLoadCurrent(loadGeneration) {
-                            self.show3DScene(from: mesh)
-                        }
-                        h(nil)
-                    }
-                } catch {
-                    log.error("Auto-load 3MF parse failed: \(error.localizedDescription, privacy: .public)")
-                    DispatchQueue.main.async {
-                        h(self.isPreviewLoadCurrent(loadGeneration)
-                            ? PreviewError.meshLoadFailed(underlying: error)
-                            : nil)
-                    }
-                }
-            }
+            load3MFScene(session: session, load: load, handler: handler)
             return
         }
 
         // Larger files: enumerate plates (Bambu/Orca 3MFs) so the user can cycle through
         // them with arrow keys before paying the cost of full 3D mesh parsing. Lazy: the
         // refs are cheap (paths only); PNG bytes are extracted on demand.
-        plates = ThreeMFExtractor.listPlates(from: url)
-        currentPlateIndex = 0
-
-        // Fall back to the legacy single-thumbnail extractor when no plates were found.
-        let firstImage: NSImage? = if !plates.isEmpty,
-                                      let data = try? ThreeMFExtractor.extractPlate(plates[0], from: url),
-                                      let img = SafePNGValidator.nsImage(fromPNG: data)
-        {
-            img
-        } else if let imageData = try? ThreeMFExtractor.extractThumbnail(from: url) {
-            SafePNGValidator.nsImage(fromPNG: imageData)
-        } else {
-            nil
-        }
-
-        if let image = firstImage {
-            // Show thumbnail + "Show 3D" button. Already on main (QuickLook invokes us on main).
-            showImage(image)
-            if plates.count > 1 {
-                showPlateLabel()
-                // Quick Look chrome usually owns first responder by the time we get here,
-                // so the root view's opportunistic claim in viewDidMoveToWindow doesn't fire.
-                // Force it now so the ← → arrow keys actually reach our keyDownHandler.
-                DispatchQueue.main.async { [weak self] in
-                    guard let self else { return }
-                    self.view.window?.makeFirstResponder(self.view)
+        session.async { archive in
+            var plates: [ThreeMFExtractor.PlateThumbnail] = []
+            var image: CGImage?
+            if let archive {
+                plates = ThreeMFExtractor.listPlates(from: archive)
+                if let first = plates.first, let data = try? ThreeMFExtractor.extractPlate(first, from: archive) {
+                    image = SafePNGValidator.cgImage(fromPNG: data, maxPixelSize: previewImageMaxPixelSize)
+                }
+                // Fall back to the legacy single-thumbnail extractor when no plate decoded.
+                if image == nil, let data = try? ThreeMFExtractor.extractThumbnail(from: archive) {
+                    image = SafePNGValidator.cgImage(fromPNG: data, maxPixelSize: previewImageMaxPixelSize)
                 }
             }
-            showShow3DButton()
-            handler(nil)
-        } else {
-            // No thumbnail at all — fall back to direct 3D load.
-            DispatchQueue.global(qos: .userInitiated).async {
-                do {
-                    let mesh = try ThreeMFMeshParser.parseMesh(
-                        from: url,
-                        limits: .quickLook,
-                        cancellation: cancellation
-                    )
-                    DispatchQueue.main.async {
-                        if self.isPreviewLoadCurrent(loadGeneration) {
-                            self.show3DScene(from: mesh)
-                        }
-                        h(nil)
+            DispatchQueue.main.async {
+                guard self.isPreviewLoadCurrent(loadGeneration) else {
+                    h(nil)
+                    return
+                }
+                guard let image else {
+                    // No thumbnail at all — fall back to direct 3D load.
+                    self.load3MFScene(session: session, load: load, handler: h)
+                    return
+                }
+                self.plates = plates
+                self.currentPlateIndex = 0
+                self.showImage(NSImage(cgImage: image, size: .zero))
+                if plates.count > 1 {
+                    self.showPlateLabel()
+                    // Quick Look chrome usually owns first responder by the time we get here,
+                    // so the root view's opportunistic claim in viewDidMoveToWindow doesn't fire.
+                    // Force it now so the ← → arrow keys actually reach our keyDownHandler.
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self else { return }
+                        self.view.window?.makeFirstResponder(self.view)
                     }
-                } catch {
-                    log.error("3MF mesh parse failed: \(error.localizedDescription, privacy: .public)")
-                    DispatchQueue.main.async {
-                        h(self.isPreviewLoadCurrent(loadGeneration)
-                            ? PreviewError.meshLoadFailed(underlying: error)
-                            : nil)
+                }
+                self.showShow3DButton()
+                h(nil)
+            }
+        }
+    }
+
+    /// Parses the 3MF on the archive session and shows it, calling `handler` exactly once.
+    private func load3MFScene(
+        session: PreviewArchiveSession,
+        load: PreviewLoad,
+        handler: @escaping (Error?) -> Void
+    ) {
+        nonisolated(unsafe) let h = handler
+        let loadGeneration = load.generation
+        let cancellation = load.cancellation
+        session.async { archive in
+            do {
+                guard let archive else { throw ThreeMFMeshParserError.cannotOpenArchive }
+                let mesh = try ThreeMFMeshParser.parseMesh(
+                    from: archive,
+                    limits: .quickLook,
+                    cancellation: cancellation
+                )
+                DispatchQueue.main.async {
+                    if self.isPreviewLoadCurrent(loadGeneration) {
+                        self.show3DScene(from: mesh)
                     }
+                    h(nil)
+                }
+            } catch {
+                log.error("3MF mesh parse failed: \(error.localizedDescription, privacy: .public)")
+                DispatchQueue.main.async {
+                    h(self.isPreviewLoadCurrent(loadGeneration)
+                        ? PreviewError.meshLoadFailed(underlying: error)
+                        : nil)
                 }
             }
         }
@@ -518,17 +555,25 @@ class PreviewViewController: NSViewController, @preconcurrency QLPreviewingContr
             plateLabel?.stringValue = plateLabelText()
             return
         }
-        // 2D thumbnail mode: swap the embedded plate PNG.
-        guard plates.count > 1, let url = fileURL else { return }
+        // 2D thumbnail mode: swap the embedded plate PNG once it is decoded off the main thread.
+        guard plates.count > 1, let session = archiveSession else { return }
         let next = (currentPlateIndex + direction + plates.count) % plates.count
         currentPlateIndex = next
-        if let imageView = plateImageView,
-           let data = try? ThreeMFExtractor.extractPlate(plates[next], from: url),
-           let image = SafePNGValidator.nsImage(fromPNG: data)
-        {
-            imageView.image = image
-        }
         plateLabel?.stringValue = plateLabelText()
+        let plate = plates[next]
+        session.async { archive in
+            guard let archive,
+                  let data = try? ThreeMFExtractor.extractPlate(plate, from: archive),
+                  let image = SafePNGValidator.cgImage(fromPNG: data, maxPixelSize: previewImageMaxPixelSize)
+            else { return }
+            DispatchQueue.main.async {
+                guard self.archiveSession === session,
+                      self.scnView == nil,
+                      self.plates[safe: self.currentPlateIndex] == plate
+                else { return }
+                self.plateImageView?.image = NSImage(cgImage: image, size: .zero)
+            }
+        }
     }
 
     // MARK: - "Show 3D" button
@@ -546,7 +591,7 @@ class PreviewViewController: NSViewController, @preconcurrency QLPreviewingContr
     }
 
     @objc private func show3DButtonTapped(_ sender: NSView) {
-        guard let url = fileURL else { return }
+        guard let session = archiveSession else { return }
         let load = beginPreviewLoad()
         let loadGeneration = load.generation
         let cancellation = load.cancellation
@@ -561,7 +606,7 @@ class PreviewViewController: NSViewController, @preconcurrency QLPreviewingContr
             overlay.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -10),
         ])
 
-        DispatchQueue.global(qos: .userInitiated).async {
+        session.async { archive in
             let progressCallback: (Float) -> Void = { fraction in
                 DispatchQueue.main.async {
                     guard self.isPreviewLoadCurrent(loadGeneration) else { return }
@@ -569,8 +614,9 @@ class PreviewViewController: NSViewController, @preconcurrency QLPreviewingContr
                 }
             }
             do {
+                guard let archive else { throw ThreeMFMeshParserError.cannotOpenArchive }
                 let mesh = try ThreeMFMeshParser.parseMesh(
-                    from: url,
+                    from: archive,
                     limits: .quickLook,
                     cancellation: cancellation,
                     progress: progressCallback
@@ -641,7 +687,6 @@ class PreviewViewController: NSViewController, @preconcurrency QLPreviewingContr
         // HUD overlay — pinned (no auto-fade). Dismissable via `i`, `?` overlay, or its × button.
         let hud = HUDOverlay()
         hud.translatesAutoresizingMaskIntoConstraints = false
-        hud.update(stats: makeStats(for: displayMesh))
         hud.onClose = { [weak self] in self?.toggleHUD() }
         view.addSubview(hud)
         NSLayoutConstraint.activate([
@@ -649,6 +694,7 @@ class PreviewViewController: NSViewController, @preconcurrency QLPreviewingContr
             hud.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 10),
         ])
         hudView = hud
+        updateHUD(for: displayMesh)
 
         addHelpBadge()
 
@@ -677,7 +723,7 @@ class PreviewViewController: NSViewController, @preconcurrency QLPreviewingContr
         // references so their toggle state stays consistent (treated as off until re-toggled).
         axisGizmoNode = nil
         bedGridNode = nil
-        hudView?.update(stats: makeStats(for: displayMesh))
+        updateHUD(for: displayMesh)
     }
 
     private func showImage(_ image: NSImage) {
@@ -696,31 +742,58 @@ class PreviewViewController: NSViewController, @preconcurrency QLPreviewingContr
 
     // MARK: - HUD
 
-    private func makeStats(for mesh: MeshData) -> HUDStats {
-        // Single-walk bbox+volume — avoids two O(N) passes over `vertices`.
-        let stats = mesh.statistics()
-        // Bambu/Orca plate JSON keyed by the currently-selected plate ID (1-based).
-        // Works for both <2MB auto-loaded 3D scenes and >=2MB thumbnail-first scenes.
-        let plateNumber = meshPlates[safe: currentPlateIndex]?.id
+    /// Bambu/Orca plate JSON keyed by the currently-selected plate ID (1-based).
+    /// Works for both <2MB auto-loaded 3D scenes and >=2MB thumbnail-first scenes.
+    private var currentPlateNumber: Int {
+        meshPlates[safe: currentPlateIndex]?.id
             ?? plates[safe: currentPlateIndex]?.index
             ?? 1
-        let plateInfo: BambuPlateInfo? = if let url = fileURL,
-                                            url.pathExtension.lowercased() == "3mf"
-        {
-            ThreeMFExtractor.extractPlateInfo(plateIndex: plateNumber, from: url)
-        } else {
-            nil
-        }
-        return HUDStats(
+    }
+
+    private func updateHUD(for mesh: MeshData) {
+        // Single-walk bbox+volume — avoids two O(N) passes over `vertices`.
+        let stats = mesh.statistics()
+        let hudStats = HUDStats(
             triangleCount: mesh.indices.count / 3,
             vertexCount: mesh.vertices.count,
             dimensionsMM: stats.boundingBox.dimensions,
             volumeMM3: stats.volume,
             fileSize: fileSizeBytes,
             metadata: mesh.metadata,
-            bambuPlate: plateInfo,
+            bambuPlate: plateInfoByNumber[currentPlateNumber],
             materials: mesh.materials
         )
+        self.hudStats = hudStats
+        hudView?.update(stats: hudStats)
+        requestPlateInfo(plateNumber: currentPlateNumber)
+    }
+
+    /// Reads the plate JSON on the archive session, then merges it into the HUD if that
+    /// plate is still the one shown.
+    private func requestPlateInfo(plateNumber: Int) {
+        guard let session = archiveSession, plateInfoRequested.insert(plateNumber).inserted else { return }
+        session.async { archive in
+            guard let archive,
+                  let info = ThreeMFExtractor.extractPlateInfo(plateIndex: plateNumber, from: archive)
+            else { return }
+            DispatchQueue.main.async {
+                guard self.archiveSession === session else { return }
+                self.plateInfoByNumber[plateNumber] = info
+                guard self.currentPlateNumber == plateNumber, let stats = self.hudStats else { return }
+                let merged = HUDStats(
+                    triangleCount: stats.triangleCount,
+                    vertexCount: stats.vertexCount,
+                    dimensionsMM: stats.dimensionsMM,
+                    volumeMM3: stats.volumeMM3,
+                    fileSize: stats.fileSize,
+                    metadata: stats.metadata,
+                    bambuPlate: info,
+                    materials: stats.materials
+                )
+                self.hudStats = merged
+                self.hudView?.update(stats: merged)
+            }
+        }
     }
 
     private func fadeOutHUD() {

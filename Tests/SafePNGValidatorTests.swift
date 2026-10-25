@@ -8,7 +8,7 @@ final class SafePNGValidatorTests: XCTestCase {
 
     func testValidate_acceptsTinyPNG() throws {
         try SafePNGValidator.validatePNGData(tinyPNG)
-        XCTAssertNotNil(SafePNGValidator.nsImage(fromPNG: tinyPNG))
+        XCTAssertNotNil(SafePNGValidator.cgImage(fromPNG: tinyPNG, maxPixelSize: 1))
     }
 
     func testValidate_rejectsEmptyData() {

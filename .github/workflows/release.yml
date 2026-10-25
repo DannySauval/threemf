@@ -11,6 +11,7 @@ jobs:
   # Job 1: Build and test (no secrets, no signing)
   build:
     runs-on: macos-15
+    timeout-minutes: 60
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -56,6 +57,7 @@ jobs:
   sign-and-release:
     needs: build
     runs-on: macos-15
+    timeout-minutes: 60
     permissions:
       contents: write
     steps:
@@ -123,6 +125,9 @@ jobs:
             --entitlements Sources/HostApp/HostApp.entitlements \
             threemf.app
 
+      - name: Verify code signature
+        run: codesign --verify --deep --strict --verbose=2 threemf.app
+
       - name: Verify universal binaries
         run: |
           set -e
@@ -157,7 +162,9 @@ jobs:
           xcrun stapler staple threemf.app
 
       - name: Create release ZIP
-        run: ditto -c -k --keepParent threemf.app threemf.zip
+        run: |
+          codesign --verify --deep --strict --verbose=2 threemf.app
+          ditto -c -k --keepParent threemf.app threemf.zip
 
       - name: Upload signed artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -225,6 +232,7 @@ jobs:
             end
 
             zap trash: [
+              "~/Library/Containers/com.andreymaltsev.3mf-quicklook",
               "~/Library/Containers/com.andreymaltsev.3mf-quicklook.findersync",
               "~/Library/Containers/com.andreymaltsev.3mf-quicklook.mdimporter",
               "~/Library/Containers/com.andreymaltsev.3mf-quicklook.preview",
@@ -241,12 +249,15 @@ jobs:
 
       - name: Cleanup keychain
         if: always()
-        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
+        run: |
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/certificate.p12"
 
   # Job 3: SLSA provenance (isolated, non-forgeable)
   provenance:
     needs: sign-and-release
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       id-token: write
       attestations: write

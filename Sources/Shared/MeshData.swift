@@ -79,7 +79,7 @@ public struct ThreeMFMetadata: Sendable, Hashable {
     }
 }
 
-public struct MeshData {
+public struct MeshData: Sendable {
     public var vertices: [simd_float3]
     public var indices: [UInt32]
     public var normals: [simd_float3]?

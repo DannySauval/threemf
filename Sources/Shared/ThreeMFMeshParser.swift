@@ -31,11 +31,29 @@ public enum ThreeMFMeshParser {
     public static let maxVertices: Int = ResourceLimits.cli.maxVertices
     public static let maxTriangles: Int = ResourceLimits.cli.maxTriangles
 
+    /// Fallback root-model locations for archives whose `_rels/.rels` is missing or unusable.
     private static let modelPaths = [
         "3D/3dmodel.model",
         "3D/3DModel.model",
         "3d/3dmodel.model",
     ]
+
+    private static let packageRelationshipsPath = "_rels/.rels"
+    private static let maxPackageRelationshipsBytes: UInt64 = 1024 * 1024
+    private static let modelRelationshipType = "http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"
+
+    /// Caps on `<component>` and `<item>` elements collected from one `.model` file. Each
+    /// component can cost an archive lookup and extraction, so the count must stay bounded.
+    static let maxComponents = 10000
+    static let maxBuildItems = 10000
+
+    /// Cap on mesh instances one parse expands build items into. Nested components multiply
+    /// (A→1,000×B→1,000×C is a million instances), which the per-file caps cannot bound.
+    static let maxEmissions = 100_000
+
+    /// The root model file holds `<metadata>` before `<resources>`, so Spotlight reads only
+    /// this much of it.
+    static let metadataPrefixBytes = 1024 * 1024
 
     /// Shared across every `.model` extraction in one parse so a component-heavy archive
     /// cannot multiply the per-entry cap by its number of entries.
@@ -71,7 +89,7 @@ public enum ThreeMFMeshParser {
 
     /// Streams an archive entry into a Data, enforcing both declared and runtime size caps.
     private static func extractCapped(
-        _ archive: Archive,
+        _ archive: ThreeMFArchive,
         entry: Entry,
         cap: UInt64,
         budget: ExtractionBudget? = nil,
@@ -86,7 +104,7 @@ public enum ThreeMFMeshParser {
         let totalSize = max(entry.uncompressedSize, 1)
         var data = Data()
         data.reserveCapacity(Int(totalSize))
-        _ = try archive.extract(entry) { chunk in
+        _ = try archive.archive.extract(entry) { chunk in
             // Chunks are large enough that polling every one is free.
             try cancellation?.check()
             // Defense against ZIP bombs: enforce the cap on the *actual* stream too.
@@ -103,12 +121,43 @@ public enum ThreeMFMeshParser {
     /// Reads an archive entry into memory if it exists, returning nil when absent or
     /// unreadable. Used for the small Bambu/Orca `Metadata/*.config` side files.
     private static func readEntryIfPresent(
-        _ archive: Archive,
+        _ archive: ThreeMFArchive,
         path: String,
         limits: ResourceLimits
     ) -> Data? {
-        guard let entry = archive[path] else { return nil }
+        guard let entry = archive.entry(path) else { return nil }
         return try? extractCapped(archive, entry: entry, cap: limits.maxMetadataSidecarBytes)
+    }
+
+    /// Root model paths to try in order: the `_rels/.rels` 3D-model relationship target when
+    /// present and safe, then the conventional locations.
+    private static func rootModelCandidates(_ archive: ThreeMFArchive) -> [String] {
+        var candidates: [String] = []
+        if let entry = archive.entry(packageRelationshipsPath),
+           let data = try? extractCapped(archive, entry: entry, cap: maxPackageRelationshipsBytes),
+           let target = modelRelationshipTarget(inRelationships: data)
+        {
+            candidates.append(target)
+        }
+        for path in modelPaths where !candidates.contains(path) {
+            candidates.append(path)
+        }
+        return candidates
+    }
+
+    /// Returns the sanitized archive path of the first 3D-model relationship in an OPC
+    /// `.rels` document, or nil when there is none or the document declares a DTD.
+    static func modelRelationshipTarget(inRelationships data: Data) -> String? {
+        // NSXMLParser expands internal entities even with external entities off.
+        guard !containsDTDOrEntityDeclaration(data) else { return nil }
+        let delegate = RelationshipsDelegate(type: modelRelationshipType)
+        let parser = XMLParser(data: data)
+        parser.delegate = delegate
+        parser.shouldProcessNamespaces = false
+        parser.shouldResolveExternalEntities = false
+        _ = parser.parse()
+        guard let target = delegate.target else { return nil }
+        return sanitizeComponentPath(target.removingPercentEncoding ?? target)
     }
 
     /// Fast path that extracts only `<metadata>` tags from the root model file.
@@ -121,42 +170,71 @@ public enum ThreeMFMeshParser {
         from fileURL: URL,
         limits: ResourceLimits = .cli
     ) throws -> ThreeMFMetadata? {
-        let archive = try Archive(url: fileURL, accessMode: .read)
-        let budget = ExtractionBudget(limits.maxModelExtractBytes)
-        for path in modelPaths {
-            guard let entry = archive[path], let data = try? extractCapped(
-                archive,
-                entry: entry,
-                cap: limits.maxModelExtractBytes,
-                budget: budget
-            ) else {
+        let archive = try ThreeMFArchive(url: fileURL)
+        for path in rootModelCandidates(archive) {
+            guard let entry = archive.entry(path),
+                  let data = try? extractPrefix(archive, entry: entry, maxBytes: metadataPrefixBytes)
+            else {
                 continue
             }
-            let result = FastMeshScanner.scan(data, limits: limits)
+            let result = FastMeshScanner.scan(data, limits: limits, metadataOnly: true)
             return result.metadata.isEmpty ? nil : result.metadata
         }
         return nil
     }
 
+    private struct PrefixComplete: Error {}
+
+    /// Decompresses at most `maxBytes` of an entry, stopping the inflate stream early.
+    private static func extractPrefix(_ archive: ThreeMFArchive, entry: Entry, maxBytes: Int) throws -> Data {
+        var data = Data()
+        do {
+            _ = try archive.archive.extract(entry, skipCRC32: true) { chunk in
+                data.append(chunk.prefix(maxBytes - data.count))
+                if data.count >= maxBytes {
+                    throw PrefixComplete()
+                }
+            }
+        } catch is PrefixComplete {}
+        return data
+    }
+
     /// Progress callback: receives a value from 0.0 to 1.0
     /// Phases: 0–0.4 = ZIP extraction, 0.4–0.8 = XML scanning, 0.8–1.0 = normal computation
+    /// Pass `computesNormals: false` when only counts, bounds, and metadata are needed.
     public static func parseMesh(
         from fileURL: URL,
         limits: ResourceLimits = .cli,
         cancellation: ParseCancellation? = nil,
+        computesNormals: Bool = true,
         progress: ((Float) -> Void)? = nil
     ) throws -> MeshData {
-        let archive: Archive
+        let archive: ThreeMFArchive
         do {
-            archive = try Archive(url: fileURL, accessMode: .read)
+            archive = try ThreeMFArchive(url: fileURL)
         } catch {
             throw ThreeMFMeshParserError.cannotOpenArchive
         }
+        return try parseMesh(
+            from: archive,
+            limits: limits,
+            cancellation: cancellation,
+            computesNormals: computesNormals,
+            progress: progress
+        )
+    }
 
+    static func parseMesh(
+        from archive: ThreeMFArchive,
+        limits: ResourceLimits = .cli,
+        cancellation: ParseCancellation? = nil,
+        computesNormals: Bool = true,
+        progress: ((Float) -> Void)? = nil
+    ) throws -> MeshData {
         let extractionBudget = ExtractionBudget(limits.maxModelExtractBytes)
         var modelData: Data?
-        for path in modelPaths {
-            if let entry = archive[path] {
+        for path in rootModelCandidates(archive) {
+            if let entry = archive.entry(path) {
                 let data = try extractCapped(
                     archive,
                     entry: entry,
@@ -200,10 +278,12 @@ public enum ThreeMFMeshParser {
                     normals: nil,
                     metadata: result.metadata.isEmpty ? nil : result.metadata
                 )
-                try mesh.computeNormals(
-                    progress: { fraction in progress?(0.8 + 0.2 * fraction) },
-                    cancellation: cancellation
-                )
+                if computesNormals {
+                    try mesh.computeNormals(
+                        progress: { fraction in progress?(0.8 + 0.2 * fraction) },
+                        cancellation: cancellation
+                    )
+                }
                 return mesh
             }
         }
@@ -236,7 +316,10 @@ public enum ThreeMFMeshParser {
             neededObjectIds = Set(result.components.map(\.objectId))
         }
 
-        // External component meshes — only extract those actually needed
+        // External component meshes — only extract those actually needed. Each archive path
+        // is extracted at most once; its lowest object id aliases later components into it.
+        var extractedPathFallbackKey: [String: String] = [:]
+        var attemptedPaths = Set<String>()
         for comp in result.components {
             try cancellation?.check()
             guard neededObjectIds.contains(comp.objectId) || neededObjectIds.contains(comp.parentObjectId) else {
@@ -249,8 +332,19 @@ public enum ThreeMFMeshParser {
             if objectMeshes[comp.objectId] != nil {
                 continue
             }
+            guard attemptedPaths.insert(normalized).inserted else {
+                if let fallbackKey = extractedPathFallbackKey[normalized],
+                   let fallbackMesh = objectMeshes[fallbackKey]
+                {
+                    objectMeshes[comp.objectId] = fallbackMesh
+                    if let paint = objectPaintStates[fallbackKey] {
+                        objectPaintStates[comp.objectId] = paint
+                    }
+                }
+                continue
+            }
 
-            if let entry = archive[normalized] {
+            if let entry = archive.entry(normalized) {
                 let data: Data
                 do {
                     data = try extractCapped(
@@ -310,13 +404,15 @@ public enum ThreeMFMeshParser {
                     }
                     // If the external file used a different internal <object id> than the
                     // referencing component's objectId, alias it deterministically.
-                    if objectMeshes[comp.objectId] == nil,
-                       let fallbackKey = compResult.objectMeshes.keys.min(),
+                    if let fallbackKey = compResult.objectMeshes.keys.min(),
                        let fallbackMesh = compResult.objectMeshes[fallbackKey]
                     {
-                        objectMeshes[comp.objectId] = fallbackMesh
-                        if let paint = compResult.objectPaintStates[fallbackKey] {
-                            objectPaintStates[comp.objectId] = paint
+                        extractedPathFallbackKey[normalized] = fallbackKey
+                        if objectMeshes[comp.objectId] == nil {
+                            objectMeshes[comp.objectId] = fallbackMesh
+                            if let paint = compResult.objectPaintStates[fallbackKey] {
+                                objectPaintStates[comp.objectId] = paint
+                            }
                         }
                     }
                 }
@@ -353,6 +449,8 @@ public enum ThreeMFMeshParser {
         }
 
         if !result.buildItems.isEmpty {
+            let componentsByParent = Dictionary(grouping: result.components, by: \.parentObjectId)
+            var emissionBudget = maxEmissions
             for item in result.buildItems {
                 // Flatten the item's object into concrete sub-meshes, each with its fully
                 // composed transform (build-item ∘ nested component transforms). The common
@@ -361,10 +459,11 @@ public enum ThreeMFMeshParser {
                 let emissions = expandObject(
                     objectId: item.objectId,
                     transform: item.transform,
-                    components: result.components,
+                    componentsByParent: componentsByParent,
                     objectMeshes: objectMeshes,
                     depth: 0,
-                    visiting: []
+                    visiting: [],
+                    budget: &emissionBudget
                 )
                 for emission in emissions {
                     try cancellation?.check()
@@ -522,13 +621,15 @@ public enum ThreeMFMeshParser {
         mesh.trianglePlates = filteredPlates
         mesh.plates = bambuConfig.plates.map { PlateInfo(id: $0.id, name: $0.name) }
         mesh.metadata = result.metadata.isEmpty ? nil : result.metadata
-        try mesh.computeNormals(
-            progress: { normalFraction in
-                // 80–100%: normal computation progress
-                progress?(0.8 + 0.2 * normalFraction)
-            },
-            cancellation: cancellation
-        )
+        if computesNormals {
+            try mesh.computeNormals(
+                progress: { normalFraction in
+                    // 80–100%: normal computation progress
+                    progress?(0.8 + 0.2 * normalFraction)
+                },
+                cancellation: cancellation
+            )
+        }
         return mesh
     }
 
@@ -638,30 +739,34 @@ public enum ThreeMFMeshParser {
     private static func expandObject(
         objectId: String,
         transform: [Float],
-        components: [ComponentRef],
+        componentsByParent: [String: [ComponentRef]],
         objectMeshes: [String: (vertices: [simd_float3], indices: [UInt32], triangleMaterials: [Int])],
         depth: Int,
-        visiting: Set<String>
+        visiting: Set<String>,
+        budget: inout Int
     ) -> [(meshObjectId: String, transform: [Float])] {
-        guard depth < maxComponentDepth, !visiting.contains(objectId) else { return [] }
+        guard budget > 0, depth < maxComponentDepth, !visiting.contains(objectId) else { return [] }
         var out: [(meshObjectId: String, transform: [Float])] = []
 
         // The object's own mesh (if any) is emitted at the inherited transform.
         if objectMeshes[objectId] != nil {
             out.append((objectId, transform))
+            budget -= 1
         }
 
         var childVisiting = visiting
         childVisiting.insert(objectId)
-        for comp in components where comp.parentObjectId == objectId {
+        for comp in componentsByParent[objectId] ?? [] {
+            guard budget > 0 else { break }
             let composed = composeTransforms(comp.transform, transform)
             out.append(contentsOf: expandObject(
                 objectId: comp.objectId,
                 transform: composed,
-                components: components,
+                componentsByParent: componentsByParent,
                 objectMeshes: objectMeshes,
                 depth: depth + 1,
-                visiting: childVisiting
+                visiting: childVisiting,
+                budget: &budget
             ))
         }
         return out
@@ -768,6 +873,31 @@ private final class NSXMLFallbackDelegate: NSObject, XMLParserDelegate {
     }
 }
 
+// MARK: - Package relationships
+
+/// Finds the `Target` of the first `<Relationship>` with the given `Type` in an OPC `.rels` file.
+private final class RelationshipsDelegate: NSObject, XMLParserDelegate {
+    private let type: String
+    private(set) var target: String?
+
+    init(type: String) {
+        self.type = type
+    }
+
+    func parser(
+        _ parser: XMLParser,
+        didStartElement elementName: String,
+        namespaceURI _: String?,
+        qualifiedName _: String?,
+        attributes attrs: [String: String] = [:]
+    ) {
+        let local = elementName.split(separator: ":").last.map(String.init) ?? elementName
+        guard local == "Relationship", attrs["Type"] == type, let value = attrs["Target"] else { return }
+        target = value
+        parser.abortParsing()
+    }
+}
+
 // MARK: - Fast byte-level mesh scanner
 
 typealias ObjectMesh = (vertices: [simd_float3], indices: [UInt32], triangleMaterials: [Int])
@@ -792,10 +922,12 @@ enum FastMeshScanner {
 
     /// Returns whatever it assembled before cancellation, so callers must re-check the
     /// token before trusting the result.
+    /// `metadataOnly` stops at the first `<resources>` tag, after the root `<metadata>` block.
     static func scan(
         _ data: Data,
         limits: ResourceLimits,
         cancellation: ParseCancellation? = nil,
+        metadataOnly: Bool = false,
         progress: ((Float) -> Void)? = nil
     ) -> ScanResult {
         data.withUnsafeBytes { rawBuffer -> ScanResult in
@@ -811,7 +943,7 @@ enum FastMeshScanner {
             }
             let count = rawBuffer.count
             var scanner = ByteScanner(base: base, count: count, limits: limits)
-            return scanner.scan(cancellation: cancellation, progress: progress)
+            return scanner.scan(cancellation: cancellation, metadataOnly: metadataOnly, progress: progress)
         }
     }
 }
@@ -873,12 +1005,13 @@ private struct ByteScanner {
 
     mutating func scan(
         cancellation: ParseCancellation? = nil,
+        metadataOnly: Bool = false,
         progress: ((Float) -> Void)? = nil
     ) -> FastMeshScanner.ScanResult {
         // Pre-estimate capacity: ~60 bytes per vertex line, ~65 bytes per triangle line
         // A typical mesh is roughly 50% vertices + 50% triangles by byte count
         let estimatedVertices = min(count / 120, limits.maxVertices)
-        if estimatedVertices > 1000 {
+        if !metadataOnly, estimatedVertices > 1000 {
             currentVertices.reserveCapacity(estimatedVertices)
             currentIndices.reserveCapacity(estimatedVertices * 3)
         }
@@ -948,6 +1081,9 @@ private struct ByteScanner {
 
             // Read tag name (stripping namespace prefix)
             let tagName = readTagName()
+            if metadataOnly, tagName == .resources {
+                break
+            }
 
             switch tagName {
             case .vertex where inMesh:
@@ -987,7 +1123,7 @@ private struct ByteScanner {
     // MARK: - Tag name matching
 
     private enum TagKind {
-        case vertex, triangle, mesh, object, component, item, basematerials, base, metadata, other
+        case vertex, triangle, mesh, object, component, item, basematerials, base, metadata, resources, other
     }
 
     private mutating func readTagName() -> TagKind {
@@ -1041,6 +1177,9 @@ private struct ByteScanner {
         case 9:
             if matchesCaseInsensitiveAt(nameStart, "component") {
                 return .component
+            }
+            if matchesCaseInsensitiveAt(nameStart, "resources") {
+                return .resources
             }
         case 13:
             if matchesCaseInsensitiveAt(nameStart, "basematerials") {
@@ -1241,6 +1380,10 @@ private struct ByteScanner {
     }
 
     private mutating func parseComponent() {
+        guard components.count < ThreeMFMeshParser.maxComponents else {
+            skipToTagEnd()
+            return
+        }
         let attrs = readAttributes(["objectid", "p:path", "path", "transform"])
         if let parentId = currentObjectId, let objId = attrs["objectid"] {
             let path = attrs["p:path"] ?? attrs["path"] ?? ""
@@ -1282,6 +1425,10 @@ private struct ByteScanner {
     }
 
     private mutating func parseItem() {
+        guard buildItems.count < ThreeMFMeshParser.maxBuildItems else {
+            skipToTagEnd()
+            return
+        }
         let attrs = readAttributes(["objectid", "transform"])
         if let objId = attrs["objectid"] {
             let transformStr = attrs["transform"] ?? "1 0 0 0 1 0 0 0 1 0 0 0"
